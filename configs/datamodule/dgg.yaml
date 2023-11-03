@@ -1,0 +1,75 @@
+_target_: src.datamodules.gmvae_datamodule.GMVAEDataModule
+
+# data_dir: "/home/kali/year2/Datasets/Visium"
+# data_dir: "/mnt/datasets/spatial_datasets/Visium"
+data_dir: "/datahome/datasets/ericteam/cskexu/spatial_datasets/Visium"
+dataset_dir: "human_dorsolateral_pre-frontal_cortex"
+data_type: "10x"
+sample_id: "151673"
+
+# data_dir: "/mnt/datasets/spatial_datasets/BGI"
+# dataset_dir: "MOSTA"
+# data_type: "bgi"
+# sample_id: "Mouse_olfa_S1"
+# sample_id: "Mouse_olfa_S2"
+# sample_id: "Mouse_brain_cell_bin"
+# sample_id: "Mouse_brain"
+# sample_id: "E12.5_E1S3.MOSTA"
+
+weighted_neigh: False
+max_dynamic_neigh: False
+dynamic_neigh_level: "domain"
+unit_fix_num: 6
+unit_dynamic_num: 12
+k: 6 # n * (n + 1) * 3
+# rec_neigh_num: False
+rec_neigh_num: 1
+# rec_neigh_num: 6
+rec_mask_neigh_threshold: null
+forward_neigh_num: False
+gat_layer_num: 0
+exchange_forward_neighbor_order: False
+
+num_hvg: 2048
+lib_norm: True
+# in_type: "raw"
+# out_type: "raw"
+in_type: "pca"
+out_type: "pca"
+# in_type: "pca_unscaled"
+# out_type: "pca_unscaled"
+# in_type: "scaled"
+# out_type: "scaled"
+compared_type: "raw"
+n_pc: 50
+test_with_gt_sp: False
+
+# batch_size: 256
+# batch_size: 3611
+# batch_size: 384
+batch_size: 192
+num_classes: "auto"
+train_val_test_split: [1, 0, 0]
+num_workers: 16
+persistent_workers: True
+prefetch_factor: 2
+# num_workers: 0
+# persistent_workers: False
+# prefetch_factor: 1
+# pin_memory: False # wsl2 does not support pin_memory=True https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-apps
+pin_memory: True
+
+seed: 42
+device: "auto"
+load_whole_graph_on_gpu: False
+z_scale: 2.
+# for 3d spatial coordinates
+# For Visium:
+# s=v/sin60=v/(√3/2)=2*√3*v/3
+# min=2v=s*√3
+# max=3s
+# For stereo-seq
+# min=s
+# max=s*√2
+
+use_ddp: False

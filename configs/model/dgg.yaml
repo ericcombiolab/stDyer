@@ -1,0 +1,96 @@
+_target_: src.models.gmvgat_model.GMVGAT
+
+add_cat_bias: False
+
+exp_self_w: 1.
+exp_neigh_w: 1.
+
+use_batch_norm: False
+
+use_pseudo_labels: False
+
+patience: 1.
+patience_start_epoch_pct: 100
+patience_diff_pct: 0.01
+
+dynamic_neigh_quantile: 0.5
+
+exp_rec_type: "Gaussian"
+# exp_rec_type: "NegativeBinomial"
+# exp_rec_type: "Bernouli"
+# gaussian_size: 4
+# gaussian_size: 16
+# gaussian_size: 32
+# gaussian_size: 64
+gaussian_size: 128
+# gaussian_size: 512
+
+exp_w_rec: 1.
+exp_w_gauss: 1.
+exp_w_cat: 1.
+exp_neigh_w_rec: 1
+exp_neigh_w_gauss: 1
+exp_neigh_w_cat: 1
+exp_sup_w_rec: 1.
+exp_sup_w_gauss: 1.
+exp_sup_w_cat: 0.
+sup_epochs: 10
+
+gaussian_start_epoch_pct: 0.
+prior_generator: "fc"
+semi_ce_degree: "just"
+# prior: "uniform"
+prior: "average_uniform"
+# prior: "average_uniform_batch"
+GMM_model_name: "VVI"
+gaussian_kind: "element-wise"
+prior_lr: 0
+allow_fewer_classes: False
+
+# activation: "relu"
+activation: "elu"
+# activation: "leaky_relu"
+# activation: "prelu"
+
+max_mu: 10.
+max_logvar: 5.
+min_logvar: -5.
+use_kl_bn: False
+kl_bn_gamma: 32.
+
+exp_encoder_channels: null
+exp_encoder_in_channels: null
+exp_encoder_out_channels: null
+exp_decoder_channels: "reverse"
+
+attention_size: null
+num_heads: 1
+dropout: 0
+use_bias: True
+# lr: 0.00001
+lr: 0.0001
+# lr: 0.000001
+lr_scheduler: "cosine"
+T_max: null
+# T_max: 5
+# T_max: 20
+cyclic_gamma: "auto"
+y_block_type: "Dense"
+z_block_type: "Dense"
+
+# weight_decay: 0
+weight_decay: 0.005
+plot_graph_size: "all"
+# plot_graph_size: 1000
+# plot_graph_size: 400
+log_path: "${paths.log_dir}"
+
+detect_anomaly: False
+# detect_anomaly: True
+
+clip_value: 0
+clip_type: "value"
+
+print_loss: False
+verbose_loss: False
+debug: False

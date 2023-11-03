@@ -1,0 +1,73 @@
+# @package _global_
+
+# to execute this experiment run:
+# python run.py experiment=example
+
+defaults:
+  - override /mode: exp.yaml
+  - override /trainer: stdyer.yaml
+  - override /model: dgg.yaml
+  - override /datamodule: dgg.yaml
+  - override /callbacks: stdyer.yaml
+  - override /logger: none.yaml
+
+# all parameters below will be merged with parameters from default configurations set above
+# this allows you to overwrite only specified parameters
+
+# name of the run determines folder name in logs
+# can also be accessed by loggers
+name: "example"
+model:
+  lr: 0.001
+  prior: "average_uniform_all_neighbors"
+  prior_lr: 0.2
+
+  gaussian_size: 64
+  attention_size: 64
+
+  exp_encoder_channels: [3000, 128, 256, 64] # [50, 64]
+  exp_decoder_channels: [64, 256, 128, 3000] # [64, 50]
+
+  y_block_type: "STAGATE_v2_improved3" # "Dense"
+  z_block_type: "STAGATE_v2_improved3" # "Dense"
+
+  T_max: 5
+  exp_neigh_w: 1.
+  exp_w_gauss: 1.
+  exp_neigh_w_gauss: 1
+  exp_w_cat: 1.
+  exp_neigh_w_cat: 1
+
+  patience_start_epoch_pct: 50
+  gaussian_start_epoch_pct: 50
+  prior_generator: "fc_mclust_rec"
+  GMM_model_name: "EEE"
+  semi_ce_degree: "1.01"
+
+trainer:
+  max_epochs: 200
+  devices: 1 # 8
+
+datamodule:
+  data_dir: "/home/comp/20481195/Datasets/STARmap"
+  dataset_dir: "20180505_BY3_1kgenes"
+  data_type: "custom"
+  data_file_name: "STARmap_20180505_BY3_1k.h5ad"
+  num_classes: 7
+
+  weighted_neigh: False
+  num_hvg: 3000
+
+  k: 8
+  rec_neigh_num: 8
+  forward_neigh_num: 8 # 0
+  max_dynamic_neigh: 8
+  unit_fix_num: 4
+  unit_dynamic_num: 4
+  dynamic_neigh_level: "unit_fix_domain_boundary"
+
+  in_type: "scaled" # "pca_scaled"
+  out_type: "scaled" # "pca_scaled"
+  batch_size: 256 # 1024
+  use_ddp: False
+  seed: null
