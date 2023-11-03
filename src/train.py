@@ -134,7 +134,6 @@ def train(config: DictConfig) -> Optional[float]:
     # log.info("torch rank", dist.get_rank())
     # print("lightning rank", trainer.global_rank)
     # print("lightning is_global_zero", trainer.is_global_zero)
-    utils.upload_res_on_daai(gpu_idx, trainer.model.log_path)
 
     # Print path to best checkpoint
     # if not config.trainer.get("fast_dev_run"):

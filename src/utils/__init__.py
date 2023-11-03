@@ -168,17 +168,3 @@ def finish(
     """Makes sure everything closed properly."""
 
     pass
-
-def write_upload_script(gpu_idx, log_path):
-    rdm = os.environ.get("rdm")
-    with open(osp.join(os.environ['HOME'], f"gpu{gpu_idx}_done_{rdm}"), "a") as upload_file:
-        upload_file.write(f"comet upload {log_path}.zip &\n")
-
-def mv_log(log_path):
-    os.system(f"mv {log_path} /home/comp/20481195/all_logs/finished_logs/{log_path.split('/')[-1]}")
-
-@rank_zero_only
-def upload_res_on_daai(gpu_idx, log_path):
-    if gpu_idx:
-        write_upload_script(gpu_idx, log_path)
-        mv_log(log_path)
