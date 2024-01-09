@@ -41,8 +41,9 @@ You can override any parameter from command line like this
 python run.py trainer.max_epochs=20
 ```
 
-Train model with your own dataset
+To train model with your own dataset, you can copy the [configs/experiment/example.yaml](configs/experiment/example.yaml) to [configs/experiment/your_experiment.yaml](configs/experiment/your_experiment.yaml) file and modify it to your needs. The required data format is h5ad, which can be created by [AnnData](https://anndata.readthedocs.io/en/latest/). The full path to h5ad file is `data_dir/dataset_dir/data_file_name`. You can also specify the requred number of spatial domains with the parameter `num_classes` in your_experiment.yaml as well.
 
 ```bash
+cp configs/experiment/example.yaml configs/experiment/your_experiment.yaml
 python run.py experiment=your_experiment.yaml
 ```
