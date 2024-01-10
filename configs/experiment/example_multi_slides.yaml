@@ -1,7 +1,7 @@
 # @package _global_
 
 # to execute this experiment run:
-# python run.py experiment=example
+# python run.py experiment=example_multi_slides
 
 defaults:
   - override /mode: exp.yaml
@@ -87,13 +87,13 @@ datamodule:
   # for 3d spatial coordinates
   # assume s is the least distance between two spatial units
   # For Visium:
-  # min=s*√3
-  # max=2s
-  # 1.73 <= z <= 2
+  # min=s
+  # max=s*√3
+  # 1 <= z <= 1.73
   # For stereo-seq
   # min=s
   # max=s*√2
   # 1 <= z <= 1.41
-  z_scale: 2.
+  z_scale: 1.5
 
   seed: 42
