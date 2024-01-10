@@ -38,7 +38,6 @@ class MyDGLDataset(DGLDataset):
         unit_dynamic_num=None,
         start_use_domain_neigh=False,
         adata=None,
-        use_image=False,
         load_whole_graph_on_gpu=False,
         seed=0,
         **kwargs,
@@ -48,7 +47,6 @@ class MyDGLDataset(DGLDataset):
         self.out_type = out_type
         self.count_key = count_key
         self.adata = adata
-        self.use_image = use_image
         self.dynamic_neigh_nums = dynamic_neigh_nums
         self.dynamic_neigh_level = dynamic_neigh_level
         self.unit_fix_num = unit_fix_num
@@ -153,22 +151,14 @@ class MyDGLDataset(DGLDataset):
         # print(self.adj.sum(0).min(), self.adj.sum(0).max())
         # print(min(self.dynamic_neigh_nums), max(self.dynamic_neigh_nums))
         exp_feature, exp_rec_feature = get_io_feature(self.adata, self.in_type, self.out_type, self.count_key)
-        if self.use_image:
-            if self.use_image.startswith("pretrained"):
-                self.graph.ndata["exp_feature"] = torch.from_numpy(np.concatenate((exp_feature, self.adata.obsm["img_attr"]), axis=1))
-                if self.in_type != self.out_type:
-                    self.graph.ndata["exp_rec_feature"] = torch.from_numpy(np.concatenate((exp_rec_feature, self.adata.obsm["img_rec_attr"]), axis=1))
-            else:
-                raise NotImplementedError
-        else:
-            self.graph.ndata["exp_feature"] = torch.from_numpy(exp_feature)
-            if "rec_mask" in self.adata.layers.keys():
-                self.graph.ndata["exp_rec_mask"] = torch.from_numpy(self.adata.layers["rec_mask"])
-            if self.in_type != self.out_type:
-                self.graph.ndata["exp_rec_feature"] = torch.from_numpy(exp_rec_feature)
+        self.graph.ndata["exp_feature"] = torch.from_numpy(exp_feature)
+        if "rec_mask" in self.adata.layers.keys():
+            self.graph.ndata["exp_rec_mask"] = torch.from_numpy(self.adata.layers["rec_mask"])
+        if self.in_type != self.out_type:
+            self.graph.ndata["exp_rec_feature"] = torch.from_numpy(exp_rec_feature)
         if self.load_whole_graph_on_gpu and torch.cuda.is_available():
             self.graph = self.graph.to(torch.device("cuda"))
-        gc.collect()
+        # gc.collect()
 
     def __getitem__(self, index: int):
         return self.graph

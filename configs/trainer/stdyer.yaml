@@ -19,3 +19,11 @@ gradient_clip_algorithm: "norm"
 
 logger: False
 enable_checkpointing: False
+
+strategy:
+  _target_: pytorch_lightning.strategies.DDPStrategy
+  find_unused_parameters: True
+  process_group_backend: "gloo"
+  timeout:
+    _target_: datetime.timedelta
+    hours: 12

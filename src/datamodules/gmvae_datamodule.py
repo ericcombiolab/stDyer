@@ -45,6 +45,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         gat_layer_num=0,
         exchange_forward_neighbor_order=False,
         sample_id="sample_id",
+        multi_slides=False,
         weighted_neigh=False,
         keep_tiles=False,
         supervise_cat=False,
@@ -52,6 +53,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         device="auto",
         load_whole_graph_on_gpu=False,
         z_scale=2.,
+        recreate_dgl_dataset=False,
         n_jobs="mean",
         use_ddp=False,
         **kwargs,
@@ -103,6 +105,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         self.sample_id = str(sample_id)
         if self.sample_id.startswith("c_"):
             self.sample_id = self.sample_id[2:]
+        self.multi_slides = multi_slides
         self.weighted_neigh = weighted_neigh
         self.keep_tiles = keep_tiles
         self.supervise_cat = supervise_cat
@@ -110,6 +113,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         self.load_whole_graph_on_gpu = load_whole_graph_on_gpu
         self.use_ddp = use_ddp
         self.z_scale = z_scale
+        self.recreate_dgl_dataset = recreate_dgl_dataset
         if n_jobs == "mean":
             try:
                 num_gpu = int(os.popen("nvidia-smi|grep Default|wc -l").read().strip())
@@ -150,6 +154,22 @@ class GMVAEDataModule(pl.LightningDataModule):
     def prepare_data(self):
         pass
 
+    def create_dgl_dataset(self):
+        self.dgl_train_dataset = MyDGLDataset(
+            in_type=self.in_type,
+            out_type=self.out_type,
+            count_key=self.data_val.count_key,
+            sample_id=self.sample_id,
+            dynamic_neigh_nums=self.data_val.dynamic_neigh_nums,
+            dynamic_neigh_level=self.dynamic_neigh_level,
+            unit_fix_num=self.unit_fix_num,
+            unit_dynamic_num=self.unit_dynamic_num,
+            start_use_domain_neigh=self.start_use_domain_neigh,
+            adata=self.data_val.adata,
+            load_whole_graph_on_gpu=self.load_whole_graph_on_gpu,
+            seed=self.seed,
+        )
+
     def setup(self, stage=None):
         train_dataset = GraphDataset(
             data_dir=self.data_dir,
@@ -176,10 +196,12 @@ class GMVAEDataModule(pl.LightningDataModule):
             forward_neigh_num=self.forward_neigh_num,
             exchange_forward_neighbor_order=self.exchange_forward_neighbor_order,
             sample_id=self.sample_id,
+            multi_slides=self.multi_slides,
             weighted_neigh=self.weighted_neigh,
             keep_tiles=self.keep_tiles,
             supervise_cat=self.supervise_cat,
             z_scale=self.z_scale,
+            use_ddp=self.use_ddp,
             device=self.device,
             seed=self.seed,
         )
@@ -188,25 +210,8 @@ class GMVAEDataModule(pl.LightningDataModule):
         self.data_val = test_dataset
         self.data_test = test_dataset
         if self.max_dynamic_neigh:
-            dgl_train_dataset = MyDGLDataset(
-                in_type=self.in_type,
-                out_type=self.out_type,
-                count_key=self.data_val.count_key,
-                sample_id=self.sample_id,
-                dynamic_neigh_nums=self.data_val.dynamic_neigh_nums,
-                dynamic_neigh_level=self.dynamic_neigh_level,
-                unit_fix_num=self.unit_fix_num,
-                unit_dynamic_num=self.unit_dynamic_num,
-                start_use_domain_neigh=self.start_use_domain_neigh,
-                adata=self.data_val.adata,
-                load_whole_graph_on_gpu=self.load_whole_graph_on_gpu,
-                seed=self.seed,
-            )
-            self.dgl_data_train = dgl_train_dataset
-            dgl_test_dataset = dgl_train_dataset
-            self.dgl_data_val = dgl_test_dataset
-            self.dgl_data_test = dgl_test_dataset
-            self.dgl_indices = torch.arange(self.dgl_data_train[0].num_nodes(), device=self.dgl_device)
+            self.create_dgl_dataset()
+            self.dgl_indices = torch.arange(self.dgl_train_dataset[0].num_nodes(), device=self.dgl_device)
             if self.forward_neigh_num:
                 # assert self.forward_neigh_num == self.rec_neigh_num
                 self.train_sampler = MyKNNMultiLayerNeighborSampler(fanouts=[self.rec_neigh_num, self.forward_neigh_num])
@@ -222,27 +227,10 @@ class GMVAEDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         if self.max_dynamic_neigh:
-            dgl_train_dataset = MyDGLDataset(
-                in_type=self.in_type,
-                out_type=self.out_type,
-                count_key=self.data_val.count_key,
-                sample_id=self.sample_id,
-                dynamic_neigh_nums=self.data_val.dynamic_neigh_nums,
-                dynamic_neigh_level=self.dynamic_neigh_level,
-                unit_fix_num=self.unit_fix_num,
-                unit_dynamic_num=self.unit_dynamic_num,
-                start_use_domain_neigh=self.start_use_domain_neigh,
-                adata=self.data_val.adata,
-                load_whole_graph_on_gpu=self.load_whole_graph_on_gpu,
-                seed=self.seed,
-            )
-            self.dgl_data_train = dgl_train_dataset
-            dgl_test_dataset = dgl_train_dataset
-            self.dgl_data_val = dgl_test_dataset
-            self.dgl_data_test = dgl_test_dataset
-
+            if self.recreate_dgl_dataset:
+                self.create_dgl_dataset()
             return DGLDataLoader(
-                self.dgl_data_train[0],
+                self.dgl_train_dataset[0],
                 self.dgl_indices,
                 self.train_sampler,
                 device=self.dgl_device,
@@ -272,7 +260,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         if self.max_dynamic_neigh:
             if self.forward_neigh_num:
                 return DGLDataLoader(
-                    self.dgl_data_val[0],
+                    self.dgl_train_dataset[0],
                     self.dgl_indices,
                     self.val_test_sampler,
                     device=self.dgl_device,
@@ -287,7 +275,7 @@ class GMVAEDataModule(pl.LightningDataModule):
             else:
                 if self.kept_val_dataloader is None:
                     self.kept_val_dataloader = DGLDataLoader(
-                        self.dgl_data_val[0],
+                        self.dgl_train_dataset[0],
                         self.dgl_indices,
                         self.val_test_sampler,
                         device=self.dgl_device,
@@ -315,7 +303,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         if self.max_dynamic_neigh:
             if self.forward_neigh_num:
                 return DGLDataLoader(
-                    self.dgl_data_test[0],
+                    self.dgl_train_dataset[0],
                     self.dgl_indices,
                     self.val_test_sampler,
                     device=self.dgl_device,
@@ -330,7 +318,7 @@ class GMVAEDataModule(pl.LightningDataModule):
             else:
                 if self.kept_test_dataloader is None:
                     self.kept_test_dataloader = DGLDataLoader(
-                        self.dgl_data_test[0],
+                        self.dgl_train_dataset[0],
                         self.dgl_indices,
                         self.val_test_sampler,
                         device=self.dgl_device,

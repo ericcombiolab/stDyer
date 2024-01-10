@@ -24,8 +24,12 @@ from datetime import datetime
 from sklearn.decomposition import PCA
 import rpy2.robjects as robjects
 import rpy2.robjects.numpy2ri
+import rpy2.robjects.packages
 from src.utils.states import GMM_model, Dynamic_neigh_level
 from torch.distributed import broadcast, gather, all_gather
+import gc
+import logging
+logging.getLogger("anndata").setLevel(logging.WARNING)
 
 # from torch.optim.lr_scheduler import SequentialLR, ConstantLR, ChainedScheduler
 # from torch.autograd import detect_anomaly
@@ -119,6 +123,8 @@ class GMVGAT(pl.LightningModule):
         print_loss=False,
         use_batch_norm=False,
         add_cat_bias=False,
+        force_enough_classes=False,
+        inbalance_weight=False,
         verbose_loss=False,
         legacy=False,
         debug=False,
@@ -219,10 +225,15 @@ class GMVGAT(pl.LightningModule):
         self.allow_fewer_classes = allow_fewer_classes
         self.print_loss = print_loss
         self.add_cat_bias = add_cat_bias
+        self.force_enough_classes = force_enough_classes
+        self.inbalance_weight = inbalance_weight
+
         self.last_epoch_exp_pred_df = None
         self.last_epoch_ARI = -1
         self.setup_num = 0
         self.not_enough_classes = False
+        self.not_enough_train_classes = False
+        self.force_add_prob_cat_domain = None
         self.stop_cluster_init = False
         self.is_mu_prior_learnable = False
         self.training_step_outputs = collections.defaultdict(list)
@@ -251,6 +262,7 @@ class GMVGAT(pl.LightningModule):
             if self.cyclic_gamma == "auto":
                 self.cyclic_gamma = 1 - 1 / self.trainer.max_epochs
             self.exp_encoder_in_channels[0] = min(self.exp_encoder_in_channels[0], self.trainer.datamodule.data_val.adata.shape[1])
+            self.exp_decoder_out_channels[-1] = min(self.exp_decoder_out_channels[-1], self.trainer.datamodule.data_val.adata.shape[1])
             self.weighted_neigh = self.trainer.datamodule.weighted_neigh
             self.num_classes = self.trainer.datamodule.data_val.num_classes
             self.num_cells = len(self.trainer.datamodule.data_val.adata)
@@ -347,10 +359,14 @@ class GMVGAT(pl.LightningModule):
     # @profile
     def dynamic_loss(self, x, out_net, output_nodes_idx, input_nodes, output_nodes, rec_neigh_attr, exp_rec_mask=None):
         data_index = output_nodes.cpu().numpy()
-        neigh_loss_dict = {"reconstruction": 0., "gaussian": 0., "categorical": 0.}
+        neigh_loss_dict = {"reconstruction": torch.tensor(0.), "gaussian": torch.tensor(0.), "categorical": torch.tensor(0.)}
         mix_x_rec = out_net["reconstructed"]
         # logits, prob_cat: (A, C)
         mix_logits, mix_prob_cat = out_net['logits'], out_net['prob_cat']
+        if self.inbalance_weight:
+            mix_pred_labels = torch.argmax(mix_prob_cat, dim=-1)
+            mix_pred_uni_label, mix_inverse, mix_pred_counts = torch.unique(mix_pred_labels, return_inverse=True, return_counts=True)
+            mix_inbalance_weight = len(mix_pred_labels) / mix_pred_counts.float()
         # y_mus, y_logvars: (C, D)
         mix_y_mus, mix_y_logvars, mix_y_var_invs = out_net["y_means"], out_net["y_logvars"], out_net["y_var_invs"]
         # mus, logvars: (C, A, D)
@@ -365,16 +381,30 @@ class GMVGAT(pl.LightningModule):
         mus, logvars = mix_mus[:, output_nodes_idx, :], mix_logvars[:, output_nodes_idx, :]
         ref_attr = rec_neigh_attr[output_nodes_idx]
         loss_rec_dict = self.losses.batch_reconstruction_loss(x, x_rec, prob_cat, rec_mask=exp_rec_mask, rec_type=self.exp_rec_type, verbose=self.verbose_loss)
-        loss_rec = loss_rec_dict["loss"].mean()
-        loss_gauss_dict = self.losses.batch_expected_gaussian_loss(prob_cat, mus, logvars, y_mus, y_logvars, affi_weights=None, y_var_invs=y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
-        loss_gauss = loss_gauss_dict["loss"].mean()
-        loss_cat = self.losses.batch_expected_categorical_loss(prob_cat, affi_weights=None, prior=self.prior, learned_prior=self.updated_prior)
+        del x_rec
+        if self.inbalance_weight:
+            loss_rec = (loss_rec_dict["loss"] * mix_inbalance_weight[mix_inverse][output_nodes_idx]).mean()
+            loss_rec = loss_rec / loss_rec.detach() * loss_rec_dict["loss"].mean().detach()
+        else:
+            loss_rec = loss_rec_dict["loss"].mean()
         if self.verbose_loss:
             self.training_step_outputs["cluster_loss_rec"].append(loss_rec_dict["cluster_loss"][:, output_nodes_idx].detach().cpu().numpy())
             self.training_step_outputs["weighted_cluster_loss_rec"].append(loss_rec_dict["weighted_cluster_loss"][:, output_nodes_idx].detach().cpu().numpy())
+        del loss_rec_dict
+        loss_gauss_dict = self.losses.batch_expected_gaussian_loss(prob_cat, mus, logvars, y_mus, y_logvars, affi_weights=None, y_var_invs=y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
+        del mus, logvars
+        if self.inbalance_weight:
+            loss_gauss = (loss_gauss_dict["loss"] * mix_inbalance_weight[mix_inverse][output_nodes_idx]).mean()
+            loss_gauss = loss_gauss / loss_gauss.detach() * loss_gauss_dict["loss"].mean().detach()
+        else:
+            loss_gauss = loss_gauss_dict["loss"].mean()
+        if self.verbose_loss:
             self.training_step_outputs["cluster_loss_gauss"].append(loss_gauss_dict["cluster_loss"][:, output_nodes_idx].detach().cpu().numpy())
             self.training_step_outputs["weighted_cluster_loss_gauss"].append(loss_gauss_dict["weighted_cluster_loss"][:, output_nodes_idx].detach().cpu().numpy())
+        del loss_gauss_dict
+        loss_cat = self.losses.batch_expected_categorical_loss(prob_cat, affi_weights=None, prior=self.prior, learned_prior=self.updated_prior)
         if self.rec_neigh_num:
+            ref_attr = rec_neigh_attr[output_nodes_idx]
             neigh_loss_rec = []
             neigh_loss_gauss = []
             neigh_prob_cat_list = []
@@ -414,10 +444,13 @@ class GMVGAT(pl.LightningModule):
                         tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask, rec_type=self.exp_rec_type, real_origin=x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), affi_weights=neigh_affi, verbose=self.verbose_loss)
                     else:
                         tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), rec_type=self.exp_rec_type, real_origin=x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), affi_weights=neigh_affi, verbose=self.verbose_loss)
+                    del neigh_x_rec
                     tmp_neigh_loss_rec = tmp_neigh_loss_rec_dict["loss"].view(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[j]
+                    del tmp_neigh_loss_rec_dict
                     neigh_loss_rec.append(tmp_neigh_loss_rec)
                     tmp_neigh_loss_gauss_dict = self.losses.batch_expected_gaussian_loss(neigh_prob_cat, neigh_mus, neigh_logvars, neigh_y_mus, neigh_y_logvars, affi_weights=neigh_affi, y_var_invs=neigh_y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
                     tmp_neigh_loss_gauss = tmp_neigh_loss_gauss_dict["loss"].view(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[j]
+                    del tmp_neigh_loss_gauss_dict, neigh_mus, neigh_logvars
                     neigh_loss_gauss.append(tmp_neigh_loss_gauss)
             elif self.dynamic_neigh_level == Dynamic_neigh_level.unit or self.dynamic_neigh_level == Dynamic_neigh_level.unit_freq_self:
                 dynamic_neigh_nums_arr = np.array(self.trainer.datamodule.data_val.dynamic_neigh_nums)
@@ -457,10 +490,13 @@ class GMVGAT(pl.LightningModule):
                         tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask, rec_type=self.exp_rec_type, real_origin=x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), affi_weights=neigh_affi, verbose=self.verbose_loss)
                     else:
                         tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), rec_type=self.exp_rec_type, real_origin=x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), affi_weights=neigh_affi, verbose=self.verbose_loss)
+                    del neigh_x_rec
                     tmp_neigh_loss_rec = tmp_neigh_loss_rec_dict["loss"].view(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[output_nodes_idx][this_cluster_node_idx]
+                    del tmp_neigh_loss_rec_dict
                     neigh_loss_rec.append(tmp_neigh_loss_rec)
                     tmp_neigh_loss_gauss_dict = self.losses.batch_expected_gaussian_loss(neigh_prob_cat, neigh_mus, neigh_logvars, neigh_y_mus, neigh_y_logvars, affi_weights=neigh_affi, y_var_invs=neigh_y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
                     tmp_neigh_loss_gauss = tmp_neigh_loss_gauss_dict["loss"].view(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[output_nodes_idx][this_cluster_node_idx]
+                    del tmp_neigh_loss_gauss_dict, neigh_mus, neigh_logvars
                     neigh_loss_gauss.append(tmp_neigh_loss_gauss)
             elif self.dynamic_neigh_level == Dynamic_neigh_level.unit_fix_domain or self.dynamic_neigh_level == Dynamic_neigh_level.unit_fix_domain_boundary or self.dynamic_neigh_level == Dynamic_neigh_level.unit_domain_boundary:
                 used_k = self.trainer.datamodule.data_val.adata[data_index].obsm["used_k"]
@@ -472,9 +508,9 @@ class GMVGAT(pl.LightningModule):
                 for dic_k, dic_v in mix_x_rec.items():
                     # dic_v.shape: (C, A, D)
                     neigh_x_rec[dic_k] = dic_v[:, batch_dynamic_neigh_idx, :]
+                del mix_x_rec, out_net["reconstructed"]
                 neigh_prob_cat = mix_prob_cat[batch_dynamic_neigh_idx]
                 neigh_y_mus, neigh_y_logvars, neigh_y_var_invs = mix_y_mus, mix_y_logvars, mix_y_var_invs
-                neigh_mus, neigh_logvars = mix_mus[:, batch_dynamic_neigh_idx, :], mix_logvars[:, batch_dynamic_neigh_idx, :]
                 this_cluster_rec_neigh_attr = rec_neigh_attr[batch_dynamic_neigh_idx].view(len(data_index), used_k.shape[1], -1)
                 # print("this_cluster_rec_neigh_attr", this_cluster_rec_neigh_attr.shape) # B x K x D
                 # print("ref_attr", ref_attr.shape) # B x D
@@ -492,17 +528,30 @@ class GMVGAT(pl.LightningModule):
                     tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x.repeat_interleave(used_k.shape[1], dim=0), neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask, rec_type=self.exp_rec_type, real_origin=x.repeat_interleave(used_k.shape[1], dim=0), affi_weights=neigh_affi, verbose=self.verbose_loss)
                 else:
                     tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x.repeat_interleave(used_k.shape[1], dim=0), neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask.repeat_interleave(used_k.shape[1], dim=0), rec_type=self.exp_rec_type, real_origin=x.repeat_interleave(used_k.shape[1], dim=0), affi_weights=neigh_affi, verbose=self.verbose_loss)
+                del neigh_x_rec
                 tmp_neigh_loss_rec = tmp_neigh_loss_rec_dict["loss"].view(-1, used_k.shape[1]).sum(-1) * self.exp_neigh_ws[output_nodes_idx]
+                del tmp_neigh_loss_rec_dict
                 neigh_loss_rec.append(tmp_neigh_loss_rec)
+                neigh_mus, neigh_logvars = mix_mus[:, batch_dynamic_neigh_idx, :], mix_logvars[:, batch_dynamic_neigh_idx, :]
                 tmp_neigh_loss_gauss_dict = self.losses.batch_expected_gaussian_loss(neigh_prob_cat, neigh_mus, neigh_logvars, neigh_y_mus, neigh_y_logvars, affi_weights=neigh_affi, y_var_invs=neigh_y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
                 tmp_neigh_loss_gauss = tmp_neigh_loss_gauss_dict["loss"].view(-1, used_k.shape[1]).sum(-1) * self.exp_neigh_ws[output_nodes_idx]
+                del tmp_neigh_loss_gauss_dict, neigh_mus, neigh_logvars, mix_logvars
                 neigh_loss_gauss.append(tmp_neigh_loss_gauss)
             assert self.prior == "average_uniform_all_neighbors"
-            neigh_loss_rec = torch.cat(neigh_loss_rec).mean()
-            neigh_loss_gauss = torch.cat(neigh_loss_gauss).mean()
+            if self.exp_neigh_w_rec != 0:
+                neigh_loss_rec = torch.cat(neigh_loss_rec).mean()
+            else:
+                neigh_loss_rec = torch.tensor(0., device=self.data_device)
+            if self.exp_neigh_w_gauss != 0:
+                neigh_loss_gauss = torch.cat(neigh_loss_gauss).mean()
+            else:
+                neigh_loss_gauss = torch.tensor(0., device=self.data_device)
             if self.weighted_neigh:
                 neigh_affi_list = torch.cat(neigh_affi_list)
-            neigh_loss_cat = self.exp_neigh_ws.mean() * self.losses.batch_expected_categorical_loss(torch.cat(neigh_prob_cat_list), affi_weights=neigh_affi_list, prior=self.prior, learned_prior=self.updated_prior)
+            if self.exp_neigh_w_cat != 0:
+                neigh_loss_cat = self.exp_neigh_ws.mean() * self.losses.batch_expected_categorical_loss(torch.cat(neigh_prob_cat_list), affi_weights=neigh_affi_list, prior=self.prior, learned_prior=self.updated_prior)
+            else:
+                neigh_loss_cat = torch.tensor(0., device=self.data_device)
             neigh_loss_total = self.exp_neigh_w_rec * neigh_loss_rec + self.exp_neigh_w_gauss * neigh_loss_gauss + self.exp_neigh_w_cat * neigh_loss_cat
             # self.time_dict["loss_sum"] = time.time()
             # print("Time for summing loss: ", self.time_dict["loss_sum"] - self.time_dict["neigh_loss"])
@@ -697,6 +746,27 @@ class GMVGAT(pl.LightningModule):
                     return exp_output_dict, neighbor_output_dict
             return exp_output_dict, None
 
+    def add_prob_cat(self, exp_output_dict, neighbor_output_dict):
+        if self.force_add_prob_cat_domain is not None:
+            # # !!!!
+            # self.prob_cat_to_add = self.prob_cat_to_add * self.num_classes
+            # # !!!!
+            if exp_output_dict is not None:
+                exp_output_dict["prob_cat"] = exp_output_dict["prob_cat"] + self.prob_cat_to_add
+                exp_output_dict["prob_cat"] = exp_output_dict["prob_cat"] / exp_output_dict["prob_cat"].sum(1, keepdim=True)
+            if neighbor_output_dict is not None:
+                for k in range(self.rec_neigh_num):
+                    neighbor_output_dict["prob_cat"][k] = neighbor_output_dict["prob_cat"][k] + self.prob_cat_to_add
+                    neighbor_output_dict["prob_cat"][k] = neighbor_output_dict["prob_cat"][k] / neighbor_output_dict["prob_cat"][k].sum(1, keepdim=True)
+            if self.prior_generator.startswith("tensor"):
+                for force_domain in self.force_add_prob_cat_domain:
+                    self.EXPGMGAT.decoder.mu_prior[force_domain].data = nn.Parameter((torch.rand((self.EXPGMGAT.decoder.z_dim), device=self.device, requires_grad=self.EXPGMGAT.decoder.mu_prior.requires_grad) - 0.5) * 2 * np.sqrt(6 / (self.EXPGMGAT.decoder.y_dim + self.EXPGMGAT.decoder.z_dim)))
+                    if self.EXPGMGAT.decoder.GMM_model_name == "VVI":
+                        self.EXPGMGAT.decoder.logvar_prior[force_domain].data = nn.Parameter((torch.rand((self.EXPGMGAT.decoder.z_dim), device=self.device, requires_grad=self.EXPGMGAT.decoder.logvar_prior.requires_grad) - 0.5) * 2 * np.sqrt(6 / (self.EXPGMGAT.decoder.y_dim + self.EXPGMGAT.decoder.z_dim)))
+                    elif self.EXPGMGAT.decoder.GMM_model_name == "EEE":
+                        self.EXPGMGAT.decoder.logvar_prior = None
+        return exp_output_dict, neighbor_output_dict
+
     # def on_train_start(self):
     #     pass
 
@@ -759,8 +829,8 @@ class GMVGAT(pl.LightningModule):
                 else:
                     exp_rec_attr = input_block.dstdata["exp_feature"]
                 exp_attr = input_block.dstdata["exp_feature"]
-            # the index of output nodes in input_nodes: input_nodes[output_nodes_idx] == output_nodes
             data_index = output_nodes.to("cpu")
+            # the index of output nodes in input_nodes: input_nodes[output_nodes_idx] == output_nodes
             output_nodes_idx = torch.nonzero(input_nodes == output_nodes.unsqueeze(1))[:, 1]
             if self.rec_mask_neigh_threshold:
                 exp_rec_mask = input_block.dstdata["exp_rec_mask"]
@@ -817,27 +887,26 @@ class GMVGAT(pl.LightningModule):
                 # exp_output_dict["prob_cat"] = torch.cdist(exp_output_dict["y_means"].unsqueeze(1), exp_output_dict["means"]).squeeze(1).transpose(0, 1)
                 # # # apply RBF kernel
                 # exp_output_dict["prob_cat"] = F.softmax(torch.exp(-torch.square(exp_output_dict["prob_cat"]) / 2), 1)
-                exp_loss_dict, neighbor_loss_dict = self.dynamic_loss(exp_rec_attr, exp_output_dict, output_nodes_idx, input_nodes, output_nodes, rec_neigh_attr, exp_rec_mask)
             else:
                 # TODO: can be simplified
                 exp_output_dict, neighbor_output_dict = self.get_forward_outputs(input_block, None, None, None)
-                exp_loss_dict, neighbor_loss_dict = self.dynamic_loss(exp_rec_attr, exp_output_dict, output_nodes_idx, input_nodes, output_nodes, rec_neigh_attr, exp_rec_mask)
+            if self.force_enough_classes:
+                exp_output_dict, neighbor_output_dict = self.add_prob_cat(exp_output_dict, neighbor_output_dict)
+            exp_loss_dict, neighbor_loss_dict = self.dynamic_loss(exp_rec_attr, exp_output_dict, output_nodes_idx, input_nodes, output_nodes, rec_neigh_attr, exp_rec_mask)
         else:
             exp_output_dict, neighbor_output_dict = self.get_forward_outputs(exp_attr, forward_neigh_attr, rec_neigh_attr, rec_forward_neigh_attr)
-            if self.debug:
-                self.trainig_step_debug_outputs["exp_output_dict"].append(copy_dict_to_cpu(exp_output_dict))
-                self.trainig_step_debug_outputs["neighbor_output_dict"].append(copy_dict_to_cpu(neighbor_output_dict))
-                debug_finite_dict(exp_output_dict, "after forward")
-                debug_finite_dict(neighbor_output_dict, "after forward")
-            # self.time_dict["forward"] = time.time()
-            # print("Time for forward", self.time_dict["forward"] - self.time_dict["begin"])
 
             exp_loss_dict, neighbor_loss_dict = self.gmvae_loss(exp_rec_attr, exp_output_dict, exp_rec_mask, neighbor_output_dict, exp_rec_neigh_affi, cat=cat, rec_cat=rec_cat)
-            if self.debug:
-                self.trainig_step_debug_outputs["exp_loss_dict"].append(copy_dict_to_cpu(exp_loss_dict))
-                self.trainig_step_debug_outputs["neighbor_loss_dict"].append(copy_dict_to_cpu(neighbor_loss_dict))
-                debug_finite_dict(exp_loss_dict, "loss")
-                debug_finite_dict(neighbor_loss_dict, "loss")
+
+        if self.debug:
+            self.trainig_step_debug_outputs["exp_output_dict"].append(copy_dict_to_cpu(exp_output_dict))
+            self.trainig_step_debug_outputs["neighbor_output_dict"].append(copy_dict_to_cpu(neighbor_output_dict))
+            debug_finite_dict(exp_output_dict, "after forward")
+            debug_finite_dict(neighbor_output_dict, "after forward")
+            self.trainig_step_debug_outputs["exp_loss_dict"].append(copy_dict_to_cpu(exp_loss_dict))
+            self.trainig_step_debug_outputs["neighbor_loss_dict"].append(copy_dict_to_cpu(neighbor_loss_dict))
+            debug_finite_dict(exp_loss_dict, "loss")
+            debug_finite_dict(neighbor_loss_dict, "loss")
 
         if self.max_dynamic_neigh:
             # already weigh neighbor loss when computing loss
@@ -855,16 +924,15 @@ class GMVGAT(pl.LightningModule):
         else:
             if self.current_epoch < self.gaussian_start_epoch_pct * self.trainer.max_epochs:
                 exp_loss = exp_reconstruction_loss + exp_categorical_loss
-            # elif (self.stop_cluster_init is False) and (self.current_epoch < (self.gaussian_start_epoch_pct * self.trainer.max_epochs + 50)) and \
             elif (self.stop_cluster_init is False) and (self.current_epoch < (self.gaussian_start_epoch_pct * self.trainer.max_epochs + self.sup_epochs)):
-                if (self.prior_generator.startswith("tensor") or self.prior_generator.endswith("mclust") or self.prior_generator.endswith("mclust_rec")):
+                if self.prior_generator.endswith("mclust") or self.prior_generator.endswith("mclust_rec"):
                     cluster_init_loss = self.cluster_init_loss(exp_output_dict, cluster_labels=self.valid_cluster_init_labels[input_nodes][output_nodes_idx], output_nodes_idx=output_nodes_idx, degree=self.semi_ce_degree)
                     self.training_step_outputs["epoch_cluster_init_loss"].append(cluster_init_loss.detach().cpu())
                     exp_loss = self.exp_sup_w_rec * exp_reconstruction_loss + self.exp_sup_w_gauss * exp_gaussian_loss + \
                         self.exp_sup_w_cat * exp_categorical_loss + cluster_init_loss
                     # exp_loss = exp_reconstruction_loss + exp_gaussian_loss + cluster_init_loss
                     # exp_loss = exp_reconstruction_loss + cluster_init_loss
-                elif self.prior_generator == "fc":
+                elif (self.prior_generator == "tensor") or (self.prior_generator == "fc"):
                     # exp_loss = exp_reconstruction_loss + 0.1 * exp_gaussian_loss + exp_categorical_loss
                     exp_loss = exp_reconstruction_loss + exp_gaussian_loss + exp_categorical_loss
             else:
@@ -882,11 +950,12 @@ class GMVGAT(pl.LightningModule):
         # print("exp_gaussian_loss", exp_gaussian_loss)
         # print("exp_categorical_loss", exp_categorical_loss)
         if self.debug:
-            self.trainig_step_debug_outputs["exp_reconstruction_loss"].append(exp_reconstruction_loss.cpu())
-            self.trainig_step_debug_outputs["exp_gaussian_loss"].append(exp_gaussian_loss.cpu())
-            self.trainig_step_debug_outputs["exp_categorical_loss"].append(exp_categorical_loss.cpu())
-            self.trainig_step_debug_outputs["exp_loss"].append(exp_loss.cpu())
+            self.trainig_step_debug_outputs["exp_reconstruction_loss"].append(exp_reconstruction_loss.detach().cpu())
+            self.trainig_step_debug_outputs["exp_gaussian_loss"].append(exp_gaussian_loss.detach().cpu())
+            self.trainig_step_debug_outputs["exp_categorical_loss"].append(exp_categorical_loss.detach().cpu())
+            self.trainig_step_debug_outputs["exp_loss"].append(exp_loss.detach().cpu())
         if self.automatic_optimization is False:
+            raise NotImplementedError
             exp_opt.zero_grad()
             # with detect_anomaly():
             # self.manual_backward(exp_loss)
@@ -938,7 +1007,6 @@ class GMVGAT(pl.LightningModule):
         # print("Time for logging: ", self.time_dict["end"] - self.time_dict["backward"])
         # print(f"stop training step {self.global_step}")
         # print(torch.cuda.memory_summary())
-
         return {"loss": exp_loss}
 
     # @profile
@@ -946,7 +1014,7 @@ class GMVGAT(pl.LightningModule):
         # print(f"start train epoch end {self.current_epoch}")
         # print(torch.cuda.memory_summary())
         # if (self.stop_cluster_init is True) and (self.prior_generator.startswith("tensor")) and (self.is_mu_prior_learnable is False):
-        if (self.current_epoch == (self.gaussian_start_epoch_pct * self.trainer.max_epochs + self.sup_epochs - 1)) and (self.prior_generator.startswith("tensor")) and (self.is_mu_prior_learnable is False):
+        if (self.current_epoch == (self.gaussian_start_epoch_pct * self.trainer.max_epochs + self.sup_epochs - 1)) and (self.prior_generator.startswith("tensor")) and ("mclust" in self.prior_generator) and (self.is_mu_prior_learnable is False):
             self.EXPGMGAT.decoder.mu_prior = nn.Parameter(self.EXPGMGAT.decoder.mu_prior, requires_grad=True)
             print("mu_prior becomes learnable")
             # print("mu_prior remains fixed")
@@ -960,7 +1028,17 @@ class GMVGAT(pl.LightningModule):
                         self.training_step_outputs[k] = torch.cat(v, dim=0)
                     else:
                         self.training_step_outputs[k] = torch.cat([vv.view(-1) for vv in v], dim=0)
-
+        if self.trainer.is_global_zero:
+            predicted_domains = torch.unique(self.training_step_outputs["epoch_exp_pred_labels"])
+            if len(predicted_domains) < self.num_classes:
+                self.not_enough_train_classes = True
+                # if self.current_epoch >= (self.gaussian_start_epoch_pct * self.trainer.max_epochs + self.sup_epochs):
+                self.force_add_prob_cat_domain = list(set(range(self.num_classes)) - set(predicted_domains.tolist()))
+                self.prob_cat_to_add = torch.zeros((1, self.num_classes), dtype=torch.float32, device=self.device)
+                self.prob_cat_to_add[0, self.force_add_prob_cat_domain] = 1. / self.num_classes
+            else:
+                self.not_enough_train_classes = False
+                self.force_add_prob_cat_domain = None
         exp_reconstruction_loss = torch.mean(self.training_step_outputs["epoch_exp_reconstruction_loss"])
         exp_gaussian_loss = torch.mean(self.training_step_outputs["epoch_exp_gaussian_loss"])
         exp_categorical_loss = torch.mean(self.training_step_outputs["epoch_exp_categorical_loss"])
@@ -1023,7 +1101,8 @@ class GMVGAT(pl.LightningModule):
             # if (self.stop_cluster_init is False) and (pred_diff_pct < 0.01) and (self.prior_generator == "tensor_mclust"):
             #     self.stop_cluster_init = True
             self.log("train/pred_diff_pct", pred_diff_pct, on_step=False, on_epoch=True, prog_bar=False, sync_dist=self.sync_dist)
-            if self.current_epoch >= self.patience_start_epoch_pct * self.trainer.max_epochs:
+            if self.current_epoch >= self.patience_start_epoch_pct * self.trainer.max_epochs - 1: # [0, 49], 50~, data preparation starts at the end of the 49th epoch
+                self.trainer.datamodule.recreate_dgl_dataset = True
                 if self.max_dynamic_neigh:
                     if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
                         for j in range(len(self.trainer.datamodule.data_val.dynamic_neigh_nums)):
@@ -1157,7 +1236,8 @@ class GMVGAT(pl.LightningModule):
         # print("max_memory_allocated", torch.cuda.max_memory_allocated() / 10**9, "GB")
         # print("max_memory_reserved", torch.cuda.max_memory_reserved() / 10**9, "GB")
         if self.max_dynamic_neigh:
-            input_nodes, output_nodes, blocks = batch
+            # input_nodes, output_nodes, blocks = batch
+            _, output_nodes, blocks = batch
             input_block = blocks[0]
             if self.forward_neigh_num:
                 # input_nodes = input_block.dstdata[NID]
@@ -1208,7 +1288,7 @@ class GMVGAT(pl.LightningModule):
         # exp_output_dict["prob_cat"] = F.softmax(torch.exp(-torch.square(exp_output_dict["prob_cat"]) / 2), 1)
 
         exp_prob_cat = exp_output_dict["prob_cat"].detach().half().cpu()
-        if self.debug:
+        if self.debug and exp_output_dict["att_x"] is not None:
             exp_att_x = exp_output_dict["att_x"].detach().cpu()
         # exp_latent = exp_output_dict["gaussians"].detach().cpu()
         exp_y_means = exp_output_dict["y_means"].detach().half().cpu()
@@ -1216,7 +1296,8 @@ class GMVGAT(pl.LightningModule):
         exp_means = exp_output_dict["means"].detach().half().cpu()
         # exp_logvars = exp_output_dict["logvars"].detach().cpu()
         if self.exp_rec_type == "Gaussian":
-            exp_rec = exp_output_dict["reconstructed"]["z_1"].detach().half().cpu()
+            # exp_rec = exp_output_dict["reconstructed"]["z_1"].detach().half().cpu() # huge memory consumption for large datasets
+            exp_mix_rec = (exp_output_dict["reconstructed"]["z_1"].detach() * exp_output_dict["prob_cat"].detach().T.unsqueeze(-1)).half().cpu()
         # elif self.exp_rec_type == "MSE":
         #     exp_rec = exp_output_dict["reconstructed"]["z"].detach().cpu()
         if self.max_dynamic_neigh:
@@ -1287,14 +1368,15 @@ class GMVGAT(pl.LightningModule):
         # if self.device.type == "cpu":
         #     self.validation_step_keep_outputs["epoch_exp_prob_cat"].append(exp_prob_cat)
         #     self.validation_step_keep_outputs["epoch_exp_gaussians"].append(exp_output_dict["gaussians"].detach().cpu())
-        if self.debug:
+        if self.debug and exp_output_dict["att_x"] is not None:
             self.validation_step_debug_outputs["epoch_exp_att_x"].append(exp_att_x)
         # self.validation_step_outputs["epoch_exp_latent"].append(exp_latent)
         self.validation_step_outputs["epoch_exp_y_means"] = exp_y_means
         # self.validation_step_outputs["epoch_exp_y_logvars"] = exp_y_logvars
         self.validation_step_outputs["epoch_exp_means"].append(exp_means)
         # self.validation_step_outputs["epoch_exp_logvars"].append(exp_logvars)
-        self.validation_step_outputs["epoch_exp_rec"].append(exp_rec)
+        # self.validation_step_outputs["epoch_exp_rec"].append(exp_rec)
+        self.validation_step_outputs["epoch_exp_mix_rec"].append(exp_mix_rec)
         # print(f"stop valid step {self.global_step}")
         # print(torch.cuda.memory_summary())
 
@@ -1313,8 +1395,8 @@ class GMVGAT(pl.LightningModule):
                 del written_adata.uns
                 written_adata.write_h5ad(osp.join(self.log_path, f"epoch_{self.current_epoch}.h5ad"), compression="gzip")
         for k, v in self.validation_step_outputs.items():
-            if (k == "epoch_exp_means") or (k == "epoch_exp_rec"):
-                self.validation_step_outputs[k] = torch.cat(v, dim=1)
+            if (k == "epoch_exp_means") or (k == "epoch_exp_rec") or (k == "epoch_exp_mix_rec"):
+                self.validation_step_outputs[k] = torch.cat(v, dim=1) # huge memory consumption for large datasets
             elif k == "epoch_exp_y_means":
                 pass
             else:
@@ -1328,14 +1410,16 @@ class GMVGAT(pl.LightningModule):
                 epoch_exp_prob_cat = self.validation_step_outputs["epoch_exp_prob_cat"].numpy()
                 epoch_exp_y_means = self.validation_step_outputs["epoch_exp_y_means"].numpy()
                 epoch_exp_means = self.validation_step_outputs["epoch_exp_means"].numpy()
-                epoch_exp_rec = self.validation_step_outputs["epoch_exp_rec"].numpy()
+                # epoch_exp_rec = self.validation_step_outputs["epoch_exp_rec"].numpy()
+                epoch_exp_mix_rec = self.validation_step_outputs["epoch_exp_mix_rec"].numpy()
             else:
                 epoch_data_index = gather_nd_to_rank(self.validation_step_outputs["data_index"], rank="all").numpy()
                 epoch_exp_pred_labels = gather_nd_to_rank(self.validation_step_outputs["epoch_exp_pred_labels"], rank="all").numpy()
                 epoch_exp_prob_cat = gather_nd_to_rank(self.validation_step_outputs["epoch_exp_prob_cat"], rank="all").numpy()
                 # epoch_exp_y_means = gather_nd_to_rank(self.validation_step_outputs["epoch_exp_y_means"]).numpy()
                 epoch_exp_means = gather_nd_to_rank(self.validation_step_outputs["epoch_exp_means"], axis=1).numpy()
-                epoch_exp_rec = gather_nd_to_rank(self.validation_step_outputs["epoch_exp_rec"], axis=1).numpy()
+                # epoch_exp_rec = gather_nd_to_rank(self.validation_step_outputs["epoch_exp_rec"], axis=1).numpy()
+                epoch_exp_mix_rec = gather_nd_to_rank(self.validation_step_outputs["epoch_exp_mix_rec"], axis=1).numpy()
 
         # print("epoch_exp_pred_labels at no_grad", epoch_exp_pred_labels.shape)
         if self.max_dynamic_neigh:
@@ -1346,7 +1430,8 @@ class GMVGAT(pl.LightningModule):
             epoch_exp_prob_cat = epoch_exp_prob_cat[sorted_epoch_data_index]
             if self.trainer.is_global_zero:
                 epoch_exp_means = epoch_exp_means[:, sorted_epoch_data_index]
-                epoch_exp_rec = epoch_exp_rec[:, sorted_epoch_data_index]
+                # epoch_exp_rec = epoch_exp_rec[:, sorted_epoch_data_index] # huge memory consumption for large datasets
+                epoch_exp_mix_rec = epoch_exp_mix_rec[:, sorted_epoch_data_index]
         if self.gaussian_start_epoch_pct > 0.:
             if self.current_epoch == (self.gaussian_start_epoch_pct * self.trainer.max_epochs - 1):
                 if self.trainer.is_global_zero:
@@ -1355,7 +1440,7 @@ class GMVGAT(pl.LightningModule):
                     # epoch_exp_prob_cat_means = np.take_along_axis(epoch_exp_means, epoch_exp_pred_labels[None, :, None], 0).squeeze(0)
                     epoch_exp_embed = np.multiply(epoch_exp_means, np.expand_dims(epoch_exp_prob_cat.T, -1))
                     epoch_exp_prob_cat_means = epoch_exp_embed.sum(0)
-                    epoch_exp_mix_rec = np.multiply(epoch_exp_rec, np.expand_dims(epoch_exp_prob_cat.T, -1))
+                    # epoch_exp_mix_rec = np.multiply(epoch_exp_rec, np.expand_dims(epoch_exp_prob_cat.T, -1))
                     epoch_exp_prob_cat_rec = epoch_exp_mix_rec.sum(0)
 
                     # epoch_exp_prob_cat_pseudo = torch.empty_like(epoch_exp_prob_cat)
@@ -1364,7 +1449,7 @@ class GMVGAT(pl.LightningModule):
                     # epoch_exp_prob_cat_means = epoch_exp_embed.sum(0)
                     # epoch_exp_mix_rec = torch.multiply(epoch_exp_rec, torch.unsqueeze(epoch_exp_prob_cat.T, -1))
                     # epoch_exp_prob_cat_rec = epoch_exp_mix_rec.sum(0)
-                if self.prior_generator.startswith("tensor") or self.prior_generator.endswith("mclust") or self.prior_generator.endswith("mclust_rec"):
+                if self.prior_generator.endswith("mclust") or self.prior_generator.endswith("mclust_rec"):
                     C, B, D = epoch_exp_means.shape
                     gt_center = np.empty((C, D))
                     sorted_pseudo_center = np.empty((C, D))
@@ -1377,39 +1462,40 @@ class GMVGAT(pl.LightningModule):
                             # original_pseudo_center[j] = np.mean(epoch_exp_prob_cat_means[epoch_exp_pred_labels == j], axis=0)
                             original_pseudo_center[j] = np.average(epoch_exp_embed[j], axis=0, weights=epoch_exp_prob_cat[:, j])
                         # original_pseudo_center_cp = original_pseudo_center.copy()
-                        if self.prior_generator == "tensor":
-                            pseudo_center, _ = kmeans_plusplus(epoch_exp_prob_cat_means.astype(np.float32), self.num_classes, random_state=self.seed)
-                        elif self.prior_generator == "tensor_mclust" or self.prior_generator == "fc_mclust" or self.prior_generator == "fc_mclust_rec":
-                            robjects.r.library("mclust")
-                            rpy2.robjects.numpy2ri.activate()
-                            r_random_seed = robjects.r['set.seed']
-                            r_random_seed(self.seed)
-                            rmclust_options = robjects.r['mclust.options']
-                            init_subset_num = 10000
-                            while True:
-                                # rmclust_options(hcModelName=hc_model_name, subset=10000)
-                                rmclust_options(subset=init_subset_num)
-                                rmclust = robjects.r['Mclust']
-                                if self.prior_generator.endswith("rec"):
-                                    mclust_pca = PCA(n_components=20, random_state=self.seed)
-                                    mclust_pca_embedding = mclust_pca.fit_transform(epoch_exp_prob_cat_rec.astype(np.float32))
-                                    rmclust_res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(mclust_pca_embedding), self.num_classes, GMM_model.EEE.name)
-                                else:
-                                    rmclust_res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(epoch_exp_prob_cat_means.astype(np.float32)), self.num_classes, GMM_model.EEE.name)
-                                mclust_prob_cat = rmclust_res[-3]
-                                if len(np.unique(mclust_prob_cat.argmax(1))) == self.num_classes:
+
+                        rpy2.robjects.packages.quiet_require("mclust")
+                        # robjects.r.library("mclust")
+                        rpy2.robjects.numpy2ri.activate()
+                        r_random_seed = robjects.r['set.seed']
+                        r_random_seed(self.seed)
+                        rmclust_options = robjects.r['mclust.options']
+                        init_subset_num = 10000
+                        while True:
+                            # rmclust_options(hcModelName=hc_model_name, subset=10000)
+                            rmclust_options(subset=init_subset_num)
+                            rmclust = robjects.r['Mclust']
+                            if self.prior_generator.endswith("rec"):
+                                mclust_pca = PCA(n_components=20, random_state=self.seed)
+                                mclust_pca_embedding = mclust_pca.fit_transform(epoch_exp_prob_cat_rec.astype(np.float32))
+                                rmclust_res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(mclust_pca_embedding), self.num_classes, GMM_model.EEE.name, verbose=False)
+                            else:
+                                rmclust_res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(epoch_exp_prob_cat_means.astype(np.float32)), self.num_classes, GMM_model.EEE.name, verbose=False)
+                            mclust_prob_cat = rmclust_res[-3]
+                            if len(np.unique(mclust_prob_cat.argmax(1))) == self.num_classes:
+                                break
+                            else:
+                                if init_subset_num >= len(epoch_exp_prob_cat_means):
+                                    print("Warning: mclust failed to obtain enough clusters.")
                                     break
-                                else:
-                                    if init_subset_num >= len(epoch_exp_prob_cat_means):
-                                        print("Warning: mclust failed to obtain enough clusters.")
-                                        break
-                                    init_subset_num *= 2
-                            # (B x D, B x C) -> (B x 1 x D, B x C x 1) -> (B x C x D) -> (C x D)
-                            pseudo_center = np.multiply(np.expand_dims(epoch_exp_prob_cat_means, 1), np.expand_dims(mclust_prob_cat, -1)).sum(0) / np.expand_dims(mclust_prob_cat.sum(0), -1)
+                                init_subset_num *= 2
+
+                        # (B x D, B x C) -> (B x 1 x D, B x C x 1) -> (B x C x D) -> (C x D)
+                        pseudo_center = np.multiply(np.expand_dims(epoch_exp_prob_cat_means, 1), np.expand_dims(mclust_prob_cat, -1)).sum(0) / np.expand_dims(mclust_prob_cat.sum(0), -1)
                         # Find the closest pseudo, ground truth center pair and remove it until each pseudo has a corresponding ground truth center
                         remaining_pseudo = np.arange(C)
                         remaining_gt = np.arange(C)
-                        sorted_mclust_prob_cat = np.empty_like(mclust_prob_cat)
+                        if "mclust" in self.prior_generator:
+                            sorted_mclust_prob_cat = np.empty_like(mclust_prob_cat)
                         for i in range(C):
                             # Compute the distance matrix between the pseudo centers and ground truth centers
                             dist_matrix = cdist(pseudo_center, original_pseudo_center, metric="euclidean")
@@ -1421,7 +1507,8 @@ class GMVGAT(pl.LightningModule):
                             # sorted_pseudo_center[remaining_pseudo[pseudo_idx]] = original_pseudo_center[gt_idx] # this seems wrong
                             # remaining_pseudo = np.delete(remaining_pseudo, pseudo_idx)
                             sorted_pseudo_center[remaining_gt[gt_idx]] = pseudo_center[pseudo_idx]
-                            sorted_mclust_prob_cat[:, remaining_gt[gt_idx]] = mclust_prob_cat[:, remaining_pseudo[pseudo_idx]]
+                            if "mclust" in self.prior_generator:
+                                sorted_mclust_prob_cat[:, remaining_gt[gt_idx]] = mclust_prob_cat[:, remaining_pseudo[pseudo_idx]]
                             remaining_pseudo = np.delete(remaining_pseudo, pseudo_idx)
                             remaining_gt = np.delete(remaining_gt, gt_idx)
                             # Remove the closest pair
@@ -1432,7 +1519,9 @@ class GMVGAT(pl.LightningModule):
                             mu_prior = torch.from_numpy(sorted_pseudo_center.astype(np.float32)).to(self.data_device)
                         else:
                             mu_prior = torch.empty_like(sorted_pseudo_center.astype(np.float32)).to(self.data_device)
-                        broadcast(mu_prior, 0)
+                        if self.trainer.world_size != 1:
+                            self.trainer.strategy.barrier()
+                            broadcast(mu_prior, 0)
                         # self.EXPGMGAT.decoder.mu_prior = nn.Parameter(torch.from_numpy(sorted_pseudo_center.astype(np.float32)).to(self.data_device), requires_grad=False)
                         self.EXPGMGAT.decoder.mu_prior = nn.Parameter(mu_prior, requires_grad=False)
                         # self.EXPGMGAT.decoder.mu_prior = nn.Parameter(torch.from_numpy(sorted_pseudo_center.astype(np.float32)).to(self.data_device))
@@ -1446,6 +1535,7 @@ class GMVGAT(pl.LightningModule):
                     else:
                         self.valid_cluster_init_labels = torch.empty(B, dtype=torch.long, device=self.device)
                     if self.trainer.world_size != 1:
+                        self.trainer.strategy.barrier()
                         broadcast(self.valid_cluster_init_labels, 0)
                     # print("mclust", np.unique(sorted_mclust_prob_cat.argmax(1), return_counts=True))
                     # print("old new centroids dist", cdist(sorted_pseudo_center, original_pseudo_center_cp, metric="euclidean"))
@@ -1532,11 +1622,15 @@ class GMVGAT(pl.LightningModule):
             self.highest_exp_ARI = max(self.highest_exp_ARI, exp_ARI)
             self.log("test/exp_ARI", exp_ARI, on_step=False, on_epoch=True, prog_bar=False, sync_dist=self.sync_dist) # may be used for early stopping
         if self.trainer.is_global_zero:
-            if len(np.unique(epoch_exp_pred_labels)) < self.num_classes:
+            predicted_domains = np.unique(epoch_exp_pred_labels)
+            if len(predicted_domains) < self.num_classes:
                 self.not_enough_classes = True
+                self.force_add_prob_cat_domain = list(set(range(self.num_classes)) - set(predicted_domains.tolist()))
+                self.prob_cat_to_add = torch.zeros((1, self.num_classes), dtype=torch.float32, device=self.device)
+                self.prob_cat_to_add[0, self.force_add_prob_cat_domain] = 1. / self.num_classes
             else:
                 self.not_enough_classes = False
-
+                self.force_add_prob_cat_domain = None
             # logging graph for visualization.
             # if self.log_path.startswith("/mnt/f/") or self.log_path.startswith("/home/kali/"):
             # print("exp_ARI - self.highest_exp_ARI:", exp_ARI - self.highest_exp_ARI)
@@ -1595,27 +1689,23 @@ class GMVGAT(pl.LightningModule):
 
             epoch_exp_pred_label_values, epoch_exp_pred_label_counts = np.unique(epoch_exp_pred_labels, return_counts=True)
             print(epoch_exp_pred_label_values, epoch_exp_pred_label_counts)
-            if self.is_labelled:
-                if self.rec_neigh_num and (not self.max_dynamic_neigh or (self.max_dynamic_neigh and self.dynamic_neigh_level == Dynamic_neigh_level.domain)):
-                    print("Epoch", self.current_epoch, "exp_ARI:", exp_ARI, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-                else:
-                    print("Epoch", self.current_epoch, "exp_ARI:", exp_ARI, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-                self.log("test/cluster_num", float(len(epoch_exp_pred_label_values)), on_step=False, on_epoch=True, prog_bar=False)
-                self.log("test/min_cluster_node_num", float(epoch_exp_pred_label_counts.min()), on_step=False, on_epoch=True, prog_bar=False)
-                self.log("test/highest_exp_ARI", self.highest_exp_ARI, on_step=False, on_epoch=True, prog_bar=False)
-            else:
-                if self.rec_neigh_num:
-                    if not self.max_dynamic_neigh:
-                        print("Epoch", self.current_epoch, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-                    else:
-                        if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
-                            if self.max_dynamic_neigh and neigh_consistency_sum_score != 0:
-                                print("Epoch", self.current_epoch, "neigh_consist:", neigh_consistency_score, "neigh_consist_sum:", neigh_consistency_sum_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-                            print("Epoch", self.current_epoch, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-                        elif self.dynamic_neigh_level.name.startswith("unit"):
-                            print("Epoch", self.current_epoch, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-                else:
+            # if self.is_labelled:
+            #     if self.rec_neigh_num and (not self.max_dynamic_neigh or (self.max_dynamic_neigh and self.dynamic_neigh_level == Dynamic_neigh_level.domain)):
+            #         print("Epoch", self.current_epoch, "exp_ARI:", exp_ARI, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+            #     else:
+            #         print("Epoch", self.current_epoch, "exp_ARI:", exp_ARI, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+            #     self.log("test/cluster_num", float(len(epoch_exp_pred_label_values)), on_step=False, on_epoch=True, prog_bar=False)
+            #     self.log("test/min_cluster_node_num", float(epoch_exp_pred_label_counts.min()), on_step=False, on_epoch=True, prog_bar=False)
+            #     self.log("test/highest_exp_ARI", self.highest_exp_ARI, on_step=False, on_epoch=True, prog_bar=False)
+            if self.rec_neigh_num:
+                if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
+                    if self.max_dynamic_neigh and neigh_consistency_sum_score != 0:
+                        print("Epoch", self.current_epoch, "neigh_consist:", neigh_consistency_score, "neigh_consist_sum:", neigh_consistency_sum_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+                    print("Epoch", self.current_epoch, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+                elif self.dynamic_neigh_level.name.startswith("unit"):
                     print("Epoch", self.current_epoch, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+            else:
+                print("Epoch", self.current_epoch, "curr_time:", datetime.now().strftime("%H:%M:%S"))
 
             # Visualize latent space.
             # result_tsne_figure_path = log_tsne_figure(

@@ -16,14 +16,8 @@ patience_diff_pct: 0.01
 dynamic_neigh_quantile: 0.5
 
 exp_rec_type: "Gaussian"
-# exp_rec_type: "NegativeBinomial"
-# exp_rec_type: "Bernouli"
-# gaussian_size: 4
-# gaussian_size: 16
-# gaussian_size: 32
-# gaussian_size: 64
+
 gaussian_size: 128
-# gaussian_size: 512
 
 exp_w_rec: 1.
 exp_w_gauss: 1.
@@ -37,12 +31,13 @@ exp_sup_w_cat: 0.
 sup_epochs: 10
 
 gaussian_start_epoch_pct: 0.
-prior_generator: "fc"
+# prior_generator: "tesnor"
+prior_generator: "fc_mclust_rec"
 semi_ce_degree: "just"
-# prior: "uniform"
-prior: "average_uniform"
-# prior: "average_uniform_batch"
-GMM_model_name: "VVI"
+
+prior: "average_uniform_all_neighbors"
+# GMM_model_name: "VVI"
+GMM_model_name: "EEE"
 gaussian_kind: "element-wise"
 prior_lr: 0
 allow_fewer_classes: False
@@ -69,20 +64,21 @@ dropout: 0
 use_bias: True
 # lr: 0.00001
 lr: 0.0001
-# lr: 0.000001
+# lr: 0.001
 lr_scheduler: "cosine"
-T_max: null
-# T_max: 5
+# T_max: null
+T_max: 5
 # T_max: 20
 cyclic_gamma: "auto"
-y_block_type: "Dense"
-z_block_type: "Dense"
+
+# y_block_type: "Dense"
+# z_block_type: "Dense"
+y_block_type: "STAGATE_v2_improved3"
+z_block_type: "STAGATE_v2_improved3"
 
 # weight_decay: 0
 weight_decay: 0.005
 plot_graph_size: "all"
-# plot_graph_size: 1000
-# plot_graph_size: 400
 log_path: "${paths.log_dir}"
 
 detect_anomaly: False
@@ -91,6 +87,8 @@ detect_anomaly: False
 clip_value: 0
 clip_type: "value"
 
-print_loss: False
+force_enough_classes: False
+inbalance_weight: False
+
 verbose_loss: False
 debug: False

@@ -32,11 +32,11 @@ dependencies:
   - bwidget=1.9.14=ha770c72_1
   - bzip2=1.0.8=h7f98852_4
   - c-ares=1.21.0=hd590300_0
-  - ca-certificates=2023.7.22=hbcca054_0
+  - ca-certificates=2023.11.17=hbcca054_0
   - cached-property=1.5.2=hd8ed1ab_1
   - cached_property=1.5.2=pyha770c72_1
   - cairo=1.18.0=h3faef2a_0
-  - certifi=2023.7.22=pyhd8ed1ab_0
+  - certifi=2023.11.17=pyhd8ed1ab_0
   - cffi=1.16.0=py310h2fee648_0
   - charset-normalizer=3.3.2=pyhd8ed1ab_0
   - colorama=0.4.6=pyhd8ed1ab_0
@@ -168,7 +168,7 @@ dependencies:
   - numpy=1.22.4=py310h4ef5377_0
   - omegaconf=2.3.0=pyhd8ed1ab_0
   - openjpeg=2.5.0=h488ebb8_3
-  - openssl=3.1.4=hd590300_0
+  - openssl=3.2.0=hd590300_1
   - packaging=23.1=pyhd8ed1ab_0
   - pandas=1.5.3=py310h9b08913_1
   - pango=1.50.14=ha41ecd1_2
@@ -191,7 +191,6 @@ dependencies:
   - pygments=2.15.1=pyhd8ed1ab_0
   - pynndescent=0.5.10=pyh1a96a4e_0
   - pyparsing=3.1.1=pyhd8ed1ab_0
-  - pyrootutils=1.0.4=pyhd8ed1ab_0
   - pysocks=1.7.1=pyha2e5f31_6
   - python=3.10.13=hd12c33a_0_cpython
   - python-dateutil=2.8.2=pyhd8ed1ab_0
@@ -263,4 +262,6 @@ dependencies:
   - zipp=3.16.0=pyhd8ed1ab_1
   - zlib=1.2.13=h166bdaf_4
   - zstd=1.5.5=hfc55251_0
+  - pip:
+      - rootutils==1.0.7
 prefix: /home/comp/20481195/miniconda3/envs/stdyer

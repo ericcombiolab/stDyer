@@ -2,13 +2,12 @@
 # faulthandler.enable()
 
 import hydra
-# import rootutils
-import pyrootutils as rootutils
+import rootutils
+# import pyrootutils as rootutils
 from omegaconf import DictConfig
 import warnings
 warnings.filterwarnings("ignore", message="Variable names are not unique. ")
 warnings.filterwarnings("ignore", message="To make them unique, call `.var_names_make_unique`.")
-warnings.filterwarnings("ignore", message=".*storing*as categorical.*")
 warnings.filterwarnings("ignore", message=".*PyTorch skipping the first value of the learning rate schedule.*")
 warnings.filterwarnings("ignore", message=".*remember to set when you upload.*")
 warnings.filterwarnings("ignore", message=".*Unknown error exporting current conda environment")

@@ -8,7 +8,7 @@ from src.models.modules.layers import (
 )
 from dgl.heterograph import DGLBlock
 import dgl.function as fn
-
+import numpy as np
 # import dgl
 
 class BoundedAct(nn.Module):
@@ -496,26 +496,27 @@ class Encoder(nn.Module):
                     else:
                         if self.forward_neigh_num > 0:
                             if isinstance(x, DGLBlock):
-                                assert self.forward_neigh_num > 0 and self.y_block_type == "STAGATE_v2_improved3"
-                                with x.local_scope():
-                                    # A x G
-                                    x.srcdata.update({'embed': layer[0](x.srcdata['exp_feature'])})
-                                    x.dstdata.update({'embed': layer[0](x.dstdata['exp_feature'])})
-                                    # B x G
-                                    x.dstdata.update({'query': layer[1](x.dstdata['embed'])})
-                                    x.srcdata.update({'key': layer[2](x.srcdata['embed'])})
-                                    # x.apply_edges(fn.v_dot_u('query', 'key', 'att'))
-                                    # x.edata["att"] = x.edata["att"] / self.scale_factor
-                                    self.propagate_attention(x, q="query", k="key", v="embed")
-                                    # x.apply_edges(fn.u_add_v('exp_feature', 'exp_feature', 'out'))
-                                    # x.apply_edges(lambda edges: {'neighbor_self_x': torch.cat([edges.src['exp_feature'], edges.dst['exp_feature']], -1)})
-                                    # x.edata["embed"] = layer[0](x.edata["neighbor_self_x"])
-                                    # print(x.ndata)
-                                    # print(x.edata)
-                                    # att_x = x.srcdata["score"]
-                                    att_x = None
-                                    concat_x = x.dstdata["wv"]
-                                    reuse_concat_x = concat_x.clone()
+                                if c == 0:
+                                    assert self.forward_neigh_num > 0 and self.y_block_type == "STAGATE_v2_improved3"
+                                    with x.local_scope():
+                                        # A x G
+                                        x.srcdata.update({'embed': layer[0](x.srcdata['exp_feature'])})
+                                        x.dstdata.update({'embed': layer[0](x.dstdata['exp_feature'])})
+                                        # B x G
+                                        x.dstdata.update({'query': layer[1](x.dstdata['embed'])})
+                                        x.srcdata.update({'key': layer[2](x.srcdata['embed'])})
+                                        # x.apply_edges(fn.v_dot_u('query', 'key', 'att'))
+                                        # x.edata["att"] = x.edata["att"] / self.scale_factor
+                                        self.propagate_attention(x, q="query", k="key", v="embed")
+                                        # x.apply_edges(fn.u_add_v('exp_feature', 'exp_feature', 'out'))
+                                        # x.apply_edges(lambda edges: {'neighbor_self_x': torch.cat([edges.src['exp_feature'], edges.dst['exp_feature']], -1)})
+                                        # x.edata["embed"] = layer[0](x.edata["neighbor_self_x"])
+                                        # print(x.ndata)
+                                        # print(x.edata)
+                                        # att_x = x.srcdata["score"]
+                                        att_x = None
+                                        concat_x = x.dstdata["wv"]
+                                        reuse_concat_x = concat_x.clone()
                         else:
                             concat_x = layer(concat_x)
                 else:
@@ -645,9 +646,11 @@ class Decoder(nn.Module):
                 self.y_logvars_1 = DenseBlock(y_dim, z_dim, activation=activation)
                 self.y_logvars_2 = nn.Linear(z_dim, z_dim)
         elif self.prior_generator.startswith("tensor"):
-            self.mu_prior = nn.Parameter(torch.randn((y_dim, z_dim), device=self.device, requires_grad=True))
+            self.mu_prior = nn.Parameter((torch.rand((y_dim, z_dim), device=self.device, requires_grad=True) - 0.5) * 2 * np.sqrt(6 / (y_dim + z_dim)))
+            # self.mu_prior = nn.Parameter(torch.randn((y_dim, z_dim), device=self.device, requires_grad=True))
             if self.GMM_model_name == "VVI":
-                self.logvar_prior = nn.Parameter(torch.randn((y_dim, z_dim), device=self.device, requires_grad=True))
+                self.logvar_prior = nn.Parameter((torch.rand((y_dim, z_dim), device=self.device, requires_grad=True) - 0.5) * 2 * np.sqrt(6 / (y_dim + z_dim)))
+                # self.logvar_prior = nn.Parameter(torch.randn((y_dim, z_dim), device=self.device, requires_grad=True))
             elif self.GMM_model_name == "EEE":
                 self.logvar_prior = None
 

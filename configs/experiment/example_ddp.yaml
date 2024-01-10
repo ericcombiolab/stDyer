@@ -16,7 +16,7 @@ defaults:
 
 # name of the run determines folder name in logs
 # can also be accessed by loggers
-name: "example"
+name: "example_ddp"
 model:
   lr: 0.001
 
@@ -26,8 +26,8 @@ model:
   gaussian_size: 64
   attention_size: 64
 
-  exp_encoder_channels: [3000, 128, 256, 64] # [50, 64]
-  exp_decoder_channels: [64, 256, 128, 3000] # [64, 50]
+  exp_encoder_channels: [3000, 128, 256, 64]
+  exp_decoder_channels: [64, 256, 128, 3000]
 
   # weight for neighbor loss, higher weights will make the predicted domains smoother
   exp_neigh_w: 1.
@@ -44,20 +44,21 @@ model:
 
 trainer:
   # number of epochs to train
-  max_epochs: 200
-  # number of GPUs to use
-  devices: 1
+  max_epochs: 100
+  # number of GPUs to use (require set datamodule.use_ddp to True at the bottom of this config file)
+  devices: 2
 
 datamodule:
-  # full path to the dataset: data_dir/dataset_dir/data_file_name
-  data_dir: "/home/comp/20481195/Datasets/STARmap"
-  dataset_dir: "20180505_BY3_1kgenes"
-  data_file_name: "STARmap_20180505_BY3_1k.h5ad"
-  data_type: "custom"
+  # full path to the dataset: data_dir/dataset_dir/sample_id.h5ad
+  data_dir: "/home/comp/20481195/Datasets/Stereo-seq"
+  dataset_dir: "MOSTA"
+  sample_id: "E16.5_E2S7.MOSTA"
+  # specify data_type as "custom" and use data_file_name for your own dataset
+  # data_file_name: "E16.5_E2S7.MOSTA.h5ad"
+  data_type: "bgi" # "custom"
 
   # number of predicted spatial domains
   num_classes: 7
-
   # number of highly variable genes
   num_hvg: 3000
 
@@ -81,6 +82,8 @@ datamodule:
   #     1. with fewer cells to improve convergence speed;
   #     2. with more cells but low-end GPU to avoid "out of GPU memory error";
   # set larger batch_size (e.g., 1024, 4096) for dataset with more cells on high-end GPU to improve GPU utilization;
-  batch_size: 256 # 1024
+  batch_size: 1024
 
+  # use pytorch ddp to support multi-gpu training
+  use_ddp: True
   seed: null

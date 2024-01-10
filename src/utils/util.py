@@ -16,6 +16,7 @@ from sklearn.neighbors import NearestNeighbors
 from collections import defaultdict
 import warnings
 import torch.distributed as dist
+import networkx as nx
 
 # https://stackoverflow.com/questions/71433507/pytorch-python-distributed-multiprocessing-gather-concatenate-tensor-arrays-of
 def gather_nd_to_rank(tensor, axis=0, rank=0):
@@ -79,7 +80,8 @@ def preallocate_mem(cuda_device):
     used = int(used)
     max_mem = int(total * 0.98)
     block_mem = max(0, max_mem - used)
-    x = torch.cuda.FloatTensor(256, 1024, block_mem)
+    # x = torch.cuda.FloatTensor(256, 1024, block_mem)
+    x = torch.zeros(256, 1024, block_mem, device=torch.device(f"cuda:{cuda_device}"))
     del x
 
 def copy_dict_delete_item(d, key):
@@ -103,7 +105,10 @@ def get_io_feature(adata, in_type, out_type, count_key):
     elif in_type == "scaled":
         exp_feature = adata.layers['scaled']
     elif in_type.startswith("pca"):
-        exp_feature = adata.obsm['X_pca']
+        if in_type.endswith("harmony"):
+            exp_feature = adata.obsm['X_pca_harmony']
+        else:
+            exp_feature = adata.obsm['X_pca']
     if out_type == "raw":
         exp_rec_feature = adata.layers[count_key]
     elif out_type == "unscaled":
@@ -111,7 +116,10 @@ def get_io_feature(adata, in_type, out_type, count_key):
     elif out_type == "scaled":
         exp_rec_feature = adata.layers['scaled']
     elif out_type.startswith("pca"):
-        exp_rec_feature = adata.obsm['X_pca']
+        if out_type.endswith("harmony"):
+            exp_rec_feature = adata.obsm['X_pca_harmony']
+        else:
+            exp_rec_feature = adata.obsm['X_pca']
     return exp_feature, exp_rec_feature
 
 def nb_func(gene_mean, r):
@@ -198,6 +206,54 @@ def construct_neighbor_graph_for_10x(adata):
     adata.obsm['sp_r_adj'] = neigh.radius_neighbors_graph()
     assert adata.obsm['sp_r_adj'].sum(1).max() == 6
 
+def load_10x_with_meta(data_dir, dataset_dir, sample_id, count_key, annotation_key, filter_genes=1, filter_cells=1, filter_unlabelled=False, load_sce=False):
+    if len(sample_id.split('_')) > 1:
+        adata = sc.read_h5ad(osp.join(data_dir, dataset_dir, sample_id, "{}.h5ad".format(sample_id)))
+    else:
+        adata = sc.read_visium(osp.join(data_dir, dataset_dir, sample_id), count_file="{}_filtered_feature_bc_matrix.h5".format(sample_id))
+        adata.X = adata.X.toarray()
+    if load_sce:
+        sce_adata = sc.read_h5ad(osp.join(data_dir, dataset_dir, sample_id, f"{sample_id}.sce.h5ad"))
+        adata.layers["logcounts"] = sce_adata.layers["logcounts"].copy()
+        adata.obsm["X_pca"] = sce_adata.obsm["PCA"].to_numpy().astype(np.float32)
+    adata.var_names_make_unique()
+    if len(sample_id.split('_')) == 1:
+        cell_meta_df = pd.read_csv(osp.join(data_dir, dataset_dir, "spatialLIBD", "{}.meta.csv.gz".format(sample_id)), index_col=0)
+        cell_meta_df = cell_meta_df.drop(columns=['in_tissue'])
+        adata.obs = cell_meta_df
+    elif len(sample_id.split('_')) > 1:
+        sample_id_list = sample_id.split('_')
+        new_obs_df = pd.DataFrame()
+        for i, a_sample_id in enumerate(sample_id_list):
+            cell_meta_df = pd.read_csv(osp.join(data_dir, dataset_dir, "spatialLIBD", "{}.meta.csv.gz".format(a_sample_id)), index_col=0)
+            cell_meta_df = cell_meta_df.drop(columns=['in_tissue'])
+            cell_meta_df = cell_meta_df.set_index("key")
+            new_obs_df = pd.concat([new_obs_df, cell_meta_df], axis=0)
+        adata.obs.index = new_obs_df.index
+        new_obs_df["batch"] = adata.obs["batch"].astype(np.int32)
+        adata.obs = new_obs_df
+    sorted_cluster_idx = adata.obs[annotation_key].value_counts().sort_index().index
+    cluster_str2int_dict = dict(zip(sorted_cluster_idx, range(len(sorted_cluster_idx))))
+    adata.obs[f"{annotation_key}_int"] = adata.obs[annotation_key].map(cluster_str2int_dict)
+    if np.sum(pd.isna(adata.obs[f"{annotation_key}_int"])) > 0:
+        try:
+            adata.obs.loc[pd.isna(adata.obs[f"{annotation_key}_int"]), f"{annotation_key}_int"] = -1
+        except:
+            adata.obs.loc[:, f"{annotation_key}_int"] = adata.obs.loc[:, f"{annotation_key}_int"].cat.add_categories([-1]).fillna(-1)
+    adata.obs[f"{annotation_key}_int"] = adata.obs[f"{annotation_key}_int"].astype(np.int32)
+    adata.obs['sum_umi'] = adata.obs['sum_umi'].astype(np.int32)
+    adata.obs['is_labelled'] = ~adata.obs[annotation_key].isna()
+    if filter_unlabelled:
+        adata = adata[~adata.obs[annotation_key].isna(), :].copy()
+    # adata._inplace_subset_var([not s.startswith("MT-") and not s.startswith("ERCC") for s in adata.var_names])
+    # adata._inplace_subset_var([not s.startswith("MT-")for s in adata.var_names])
+    adata._inplace_subset_var([not s.startswith("ERCC") for s in adata.var_names])
+    sc.pp.filter_genes(adata, min_counts=filter_genes)
+    sc.pp.filter_cells(adata, min_counts=filter_cells)
+    adata.obsm['spatial'] = adata.obsm['spatial'].astype(np.float32)
+    adata.layers[count_key] = adata.X.copy()
+    return adata
+
 def get_spatial_neighbors(adata, index='all', k=6):
     if index == 'all':
         index = np.arange(adata.shape[0])
@@ -241,14 +297,18 @@ def get_spot_and_neighbors_attribute(adata, attr, k=6):
 
 def copy_dict_to_cpu(dic):
     new_dic = {}
-    for k, v in dic.items():
-        if isinstance(v, dict) or isinstance(v, defaultdict):
-            new_dic[k] = copy_dict_to_cpu(v)
-        elif isinstance(v, torch.Tensor):
-            new_dic[k] = v.cpu()
-        else:
-            new_dic[k] = v
-    return new_dic
+    if dic is not None:
+        for k, v in dic.items():
+            if isinstance(v, dict) or isinstance(v, defaultdict):
+                new_dic[k] = copy_dict_to_cpu(v)
+            elif isinstance(v, torch.Tensor):
+                new_dic[k] = v.detach().cpu()
+            else:
+                # print(k, v) # att_x
+                new_dic[k] = v
+        return new_dic
+    else:
+        return None
 
 def debug_finite_param(module, where=""):
     stop_flag = False
@@ -277,18 +337,59 @@ def debug_finite_grad(module, where=""):
 
 def debug_finite_dict(dic, what=""):
     stop_flag = False
-    for k, v in dic.items():
-        if isinstance(v, torch.Tensor):
-            if torch.isnan(v).any():
-                logging.error(f"{what} Tensor with key {k} has NaN")
-                stop_flag = True
-            if torch.isinf(v).any():
-                logging.error(f"{what} Dictionary with key {k} has infinite")
-                stop_flag = True
-        elif isinstance(v, defaultdict):
-            debug_finite_dict(v, what=f"{what} (neighbor)")
+    if dic is not None:
+        for k, v in dic.items():
+            if isinstance(v, torch.Tensor):
+                if torch.isnan(v).any():
+                    logging.error(f"{what} Tensor with key {k} has NaN")
+                    stop_flag = True
+                if torch.isinf(v).any():
+                    logging.error(f"{what} Dictionary with key {k} has infinite")
+                    stop_flag = True
+            elif isinstance(v, defaultdict):
+                debug_finite_dict(v, what=f"{what} (neighbor)")
     if stop_flag:
         raise
+
+def create_sp_graph(plot_node_idx, sp_bi_adj):
+    """Create sp graph based on the sampled contig list and its neighbors,
+    remember to reindex the contig id, cause igraph.Graph object indexing
+    from 0 to self.plot_graph_size-1.
+
+    Args:
+        plot_node_idx (list): list of sampled contig ids.
+        batch (dictionary): batch from datamodule to get the neighbors id.
+
+    Returns:
+        sp_graph (igraph.Graph): reindexed igraph.Graph object.
+    """
+    # sp_graph = nx.from_numpy_array(np.squeeze(sp_bi_adj), create_using=nx.DiGraph)
+    sp_graph = nx.from_scipy_sparse_array(sp_bi_adj, create_using=nx.DiGraph)
+    # print(sp_graph)
+    sp_graph.remove_nodes_from([n for n in sp_graph if n not in plot_node_idx])
+    # print(sp_graph)
+    return sp_graph
+
+
+def create_exp_graph(plot_node_idx, exp_vis_bi_adj):
+    """Create exp graph based on the sampled contig list and its neighbors,
+    remember to reindex the contig id, cause igraph.Graph object indexing
+    from 0 to self.plot_graph_size-1.
+
+    Args:
+        plot_node_idx.
+        batch (dictionary): batch from datamodule to get the neighbors id.
+
+    Returns:
+        exp_graph (igraph.Graph): reindexed igraph.Graph object.
+    """
+
+    # exp_graph = nx.from_numpy_array(np.squeeze(exp_vis_bi_adj), create_using=nx.DiGraph)
+    exp_graph = nx.from_scipy_sparse_array(exp_vis_bi_adj, create_using=nx.DiGraph)
+    # print(exp_graph)
+    exp_graph.remove_nodes_from([n for n in exp_graph if n not in plot_node_idx])
+    # print(exp_graph)
+    return exp_graph
 
 def plot_graph(graph, log_path, current_epoch, graph_type, labels):
     """Plot graph to disk.
@@ -473,7 +574,26 @@ def log_tissue_graph(
                 scatter_df_cols = ["x", "y", "z"]
             scatter_df = pd.DataFrame(adata.obsm["spatial"], columns=scatter_df_cols)
             if "annotation_colors" in adata.uns:
-                scatter_df[f"{annotation_key}"] = adata.obs[f"{annotation_key}"].cat.rename_categories(adata.uns["annotation_colors"]).values
+                try:
+                    scatter_df[f"{annotation_key}"] = adata.obs[f"{annotation_key}"].cat.rename_categories(adata.uns["annotation_colors"]).values
+                except:
+                    # scatter_df[f"{annotation_key}"] = adata.obs[f"{annotation_key}"].map(dict(zip(adata.obs[f"{annotation_key}"].cat.categories, adata.uns["annotation_colors"])))
+                    unique_color = set(adata.uns["annotation_colors"].tolist())
+                    if len(unique_color) < len(adata.obs[f"{annotation_key}"].cat.categories):
+                        if len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 1:
+                            if "#ff000000" not in unique_color: # balck
+                                unique_color.add("#ff000000")
+                            elif "#ffffffff" not in unique_color: # white
+                                unique_color.add("#ffffffff")
+                            else:
+                                raise NotImplementedError
+                        elif len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 2:
+                            assert "#ff000000" not in unique_color and "#ffffffff" not in unique_color
+                            unique_color.add("#ff000000")
+                            unique_color.add("#ffffffff")
+                        else:
+                            raise NotImplementedError
+                    scatter_df[f"{annotation_key}"] = adata.obs[f"{annotation_key}"].cat.rename_categories(list(unique_color)).values
             else:
                 tmp_anno_series = adata.obs[f"{annotation_key}"].cat.add_categories("Unknown")
                 tmp_anno_series = tmp_anno_series.fillna("Unknown")
@@ -513,7 +633,26 @@ def log_tissue_graph(
         scatter_df = pd.DataFrame(adata.obsm["spatial"], columns=scatter_df_cols)
         pred_cluster_num = len(np.unique(pred_labels))
         if "annotation_colors" in adata.uns:
-            scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(adata.uns["annotation_colors"][:pred_cluster_num]).values
+            try:
+                scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(adata.uns["annotation_colors"][:pred_cluster_num]).values
+            except:
+                # scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].map(dict(zip(adata.obs["plot_pred_labels"].cat.categories, adata.uns["annotation_colors"])))
+                unique_color = set(adata.uns["annotation_colors"].tolist())
+                if len(unique_color) < len(adata.obs[f"{annotation_key}"].cat.categories):
+                    if len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 1:
+                        if "#ff000000" not in unique_color: # balck
+                            unique_color.add("#ff000000")
+                        elif "#ffffffff" not in unique_color: # white
+                            unique_color.add("#ffffffff")
+                        else:
+                            raise NotImplementedError
+                    elif len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 2:
+                        assert "#ff000000" not in unique_color and "#ffffffff" not in unique_color
+                        unique_color.add("#ff000000")
+                        unique_color.add("#ffffffff")
+                    else:
+                        raise NotImplementedError
+                scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(list(unique_color)).values
         else:
             scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(COLOUR_DICT[:pred_cluster_num]).values
         if data_val.sample_id.startswith("GSM483813") or data_val.sample_id == "zebrafish_tumor":
@@ -629,6 +768,13 @@ def resample_per_cell(X, target, rng, replace=True):
     for i in range(X.shape[0]):
         new_X[i] = downsample_array(X[i], target, rng, replace)
     return new_X
+
+def describe_graph(graph_type: str, graph: nx.Graph):
+    graph_nodes = graph.number_of_nodes()
+    graph_edges = graph.number_of_edges()
+    print("{} graph details: nodes: {}; edges: {}".format(
+        graph_type, graph_nodes, graph_edges
+    ))
 
 def get_mul_mask_matrix(adj_matrix):
     """Get multiplication mask matrix from adjacency matrix;

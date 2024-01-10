@@ -119,7 +119,7 @@ class VAE(nn.Module):
             activation=self.activation,
             use_batch_norm=self.use_batch_norm,
             prior_generator=self.prior_generator,
-            g_dim=self.encoder_in_channels[0],
+            g_dim=self.decoder_out_channels[-1],
             GMM_model_name=self.GMM_model_name,
             device=self.device,
             legacy=self.legacy,

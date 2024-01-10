@@ -13,6 +13,8 @@ import time
 import torch
 import gc
 from src.utils.states import Dynamic_neigh_level
+import torch.distributed as dist
+
 
 class GraphDataset(Dataset):
     """Graph dataset object, loading dataset in a batch-wise manner.
@@ -53,7 +55,9 @@ class GraphDataset(Dataset):
         forward_neigh_num=0,
         exchange_forward_neighbor_order=False,
         sample_id: str = "sample_id",
+        multi_slides=False,
         z_scale: float = 2.,
+        use_ddp=False,
         weighted_neigh=False,
         supervise_cat=False,
         n_jobs=-1,
@@ -84,6 +88,7 @@ class GraphDataset(Dataset):
         self.use_cell_mask = use_cell_mask
         self.keep_tiles = keep_tiles
         self.supervise_cat = supervise_cat
+        self.use_ddp = use_ddp
         self.device = device
         self.seed = seed
         self.test_with_gt_sp = test_with_gt_sp
@@ -98,10 +103,16 @@ class GraphDataset(Dataset):
         self.n_jobs = n_jobs
         self.resolution = resolution
         self.sample_id = str(sample_id)
+        self.multi_slides = multi_slides
         self.z_scale = z_scale
         self.full_adata = None
 
-        if self.data_type == "custom":
+        if self.data_type == '10x':
+            self.get_10x_data()
+        elif self.data_type == 'bgi':
+            self.bin_size = 50
+            self.get_bgi_data()
+        elif self.data_type == "custom":
             self.get_custom_data()
         self.compute_nearest()
         self.compute_out_log_sigma()
@@ -400,8 +411,11 @@ class GraphDataset(Dataset):
                 pca = PCA(n_components=self.n_pc, random_state=self.seed)
                 if self.in_type == 'pca_unscaled':
                     self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.layers['unscaled'])
-                elif self.in_type == 'pca_scaled' or self.in_type == 'pca':
+                elif self.in_type == 'pca_scaled' or self.in_type == 'pca' or self.in_type == "pca_harmony":
                     self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.layers['scaled'])
+                    if self.in_type == "pca_harmony":
+                        import scanpy.external as sce
+                        sce.pp.harmony_integrate(self.adata, "batch")
                 else:
                     self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.X)
                 self.adata.uns["normalized_pca_explained_variance_ratio"] = pca.explained_variance_ratio_ / pca.explained_variance_ratio_.sum()
@@ -431,8 +445,13 @@ class GraphDataset(Dataset):
                 neigh = NearestNeighbors(n_neighbors=self.max_dynamic_neigh, n_jobs=self.n_jobs)
             else:
                 neigh = NearestNeighbors(n_neighbors=max(self.rec_neigh_num, self.forward_neigh_num), n_jobs=self.n_jobs)
-            if self.data_type == "10x" and len(self.sample_id.split('_')) > 1:
+            if (self.data_type == "10x" and len(self.sample_id.split('_')) > 1 and (not self.sample_id.startswith("GSM"))):
                 neigh.fit(self.adata[self.adata.obs["batch"] == 0].obsm['spatial'])
+                first_slide_sp_dist, _ = neigh.kneighbors(return_distance=True)
+                min_unit_dist = first_slide_sp_dist.min()
+                self.adata.obsm['spatial'] = np.hstack((self.adata.obsm['spatial'], (self.adata.obs["batch"] * min_unit_dist * self.z_scale).to_numpy().reshape(-1, 1)))
+            elif self.multi_slides:
+                neigh.fit(self.adata[self.adata.obs["batch"] == self.adata.obs["batch"].unique()[0]].obsm['spatial'])
                 first_slide_sp_dist, _ = neigh.kneighbors(return_distance=True)
                 min_unit_dist = first_slide_sp_dist.min()
                 self.adata.obsm['spatial'] = np.hstack((self.adata.obsm['spatial'], (self.adata.obs["batch"] * min_unit_dist * self.z_scale).to_numpy().reshape(-1, 1)))
@@ -462,4 +481,22 @@ class GraphDataset(Dataset):
 
     def get_custom_data(self):
         self.adata = sc.read_h5ad(osp.join(self.data_dir, self.dataset_dir, self.data_file_name))
+        self.preprocess_data()
+
+    def get_10x_data(self):
+        self.count_key = "counts"
+        self.annotation_key = "spatialLIBD"
+        self.adata = load_10x_with_meta(self.data_dir, self.dataset_dir, self.sample_id, self.count_key, self.annotation_key, filter_genes=1, filter_cells=1, filter_unlabelled=self.test_with_gt_sp)
+        self.preprocess_data()
+
+    def get_bgi_data(self):
+        exp_file_path = osp.join(self.data_dir, self.dataset_dir, self.sample_id + ".h5ad")
+        logging.debug(f"Loading data from {self.sample_id}")
+        tic = time.time()
+        self.adata = sc.read_h5ad(exp_file_path)
+        toc = time.time()
+        logging.debug(f"Loading data takes {(toc - tic)/60:.2f} mins.")
+        self.annotation_key = "annotation"
+        if self.sample_id in ["E12.5_E1S3.MOSTA", "E14.5_E1S3.MOSTA", "E16.5_E1S3.MOSTA", "E16.5_E2S1.MOSTA", "E16.5_E2S2.MOSTA", "E16.5_E2S3.MOSTA", "E16.5_E2S4.MOSTA", "E16.5_E2S5.MOSTA", "E16.5_E2S6.MOSTA", "E16.5_E2S7.MOSTA", "E16.5_E2S8.MOSTA", "E16.5_E2S9.MOSTA", "E16.5_E2S10.MOSTA", "E16.5_E2S11.MOSTA", "E16.5_E2S12.MOSTA", "E16.5_E2S13.MOSTA"]:
+            self.count_key = "count"
         self.preprocess_data()
