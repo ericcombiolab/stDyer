@@ -87,14 +87,13 @@ datamodule:
   # for 3d spatial coordinates
   # assume s is the least distance between two spatial units
   # For Visium:
-  # s=v/sin60=v/(√3/2)=2*√3*v/3
-  # min=2v=s*√3
-  # max=3s
-  # 1.73 < z < 3
+  # min=s*√3
+  # max=2s
+  # 1.73 <= z <= 2
   # For stereo-seq
   # min=s
   # max=s*√2
-  # 1 < z < 1.41
+  # 1 <= z <= 1.41
   z_scale: 2.
 
   seed: 42
