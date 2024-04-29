@@ -52,11 +52,16 @@ max_logvar: 5.
 min_logvar: -5.
 use_kl_bn: False
 kl_bn_gamma: 32.
+min_cluster_size: 100
 
 exp_encoder_channels: null
 exp_encoder_in_channels: null
 exp_encoder_out_channels: null
 exp_decoder_channels: "reverse"
+
+detect_svg: null
+
+refine_ae_channels: null
 
 attention_size: null
 num_heads: 1

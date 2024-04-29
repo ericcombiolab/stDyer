@@ -23,6 +23,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         train_val_test_split,
         data_file_name=None,
         count_key=None,
+        annotation_key=None,
         num_classes="auto",
         num_hvg=2048,
         lib_norm=True,
@@ -53,6 +54,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         device="auto",
         load_whole_graph_on_gpu=False,
         z_scale=2.,
+        resample_to=None,
         recreate_dgl_dataset=False,
         n_jobs="mean",
         use_ddp=False,
@@ -71,6 +73,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         self.out_type = out_type
         self.compared_type = compared_type
         self.count_key = count_key
+        self.annotation_key = annotation_key
         self.train_val_test_split = train_val_test_split
         self.data_file_name = data_file_name
         self.num_classes = num_classes
@@ -113,6 +116,7 @@ class GMVAEDataModule(pl.LightningDataModule):
         self.load_whole_graph_on_gpu = load_whole_graph_on_gpu
         self.use_ddp = use_ddp
         self.z_scale = z_scale
+        self.resample_to = resample_to
         self.recreate_dgl_dataset = recreate_dgl_dataset
         if n_jobs == "mean":
             try:
@@ -134,22 +138,7 @@ class GMVAEDataModule(pl.LightningDataModule):
             self.num_workers = os.cpu_count()
         else:
             self.num_workers = num_workers
-        if device == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
-        if self.max_dynamic_neigh:
-            if self.device.type.startswith("cuda"):
-                self.num_workers = 0
-                self.dgl_device = torch.device("cuda")
-                self.persistent_workers = False
-                if not self.load_whole_graph_on_gpu:
-                    self.use_uva = True
-                else:
-                    self.use_uva = False
-            else:
-                self.dgl_device = torch.device("cpu")
-                self.use_uva = False
+        self.device = device
 
     def prepare_data(self):
         pass
@@ -168,9 +157,27 @@ class GMVAEDataModule(pl.LightningDataModule):
             adata=self.data_val.adata,
             load_whole_graph_on_gpu=self.load_whole_graph_on_gpu,
             seed=self.seed,
+            device=self.dgl_device,
         )
 
     def setup(self, stage=None):
+        if self.device == "auto":
+            # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device(torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        else:
+            self.device = torch.device(self.device)
+        if self.device.type.startswith("cuda"):
+            self.num_workers = 0
+            # self.dgl_device = torch.device("cuda")
+            self.dgl_device = torch.device(torch.cuda.current_device())
+            self.persistent_workers = False
+            if not self.load_whole_graph_on_gpu:
+                self.use_uva = True
+            else:
+                self.use_uva = False
+        else:
+            self.dgl_device = torch.device("cpu")
+            self.use_uva = False
         train_dataset = GraphDataset(
             data_dir=self.data_dir,
             dataset_dir=self.dataset_dir,
@@ -179,6 +186,7 @@ class GMVAEDataModule(pl.LightningDataModule):
             out_type=self.out_type,
             compared_type=self.compared_type,
             count_key=self.count_key,
+            annotation_key=self.annotation_key,
             num_classes=self.num_classes,
             data_file_name=self.data_file_name,
             num_hvg=self.num_hvg,
@@ -201,6 +209,7 @@ class GMVAEDataModule(pl.LightningDataModule):
             keep_tiles=self.keep_tiles,
             supervise_cat=self.supervise_cat,
             z_scale=self.z_scale,
+            resample_to=self.resample_to,
             use_ddp=self.use_ddp,
             device=self.device,
             seed=self.seed,
@@ -209,16 +218,15 @@ class GMVAEDataModule(pl.LightningDataModule):
         test_dataset = train_dataset
         self.data_val = test_dataset
         self.data_test = test_dataset
-        if self.max_dynamic_neigh:
-            self.create_dgl_dataset()
-            self.dgl_indices = torch.arange(self.dgl_train_dataset[0].num_nodes(), device=self.dgl_device)
-            if self.forward_neigh_num:
-                # assert self.forward_neigh_num == self.rec_neigh_num
-                self.train_sampler = MyKNNMultiLayerNeighborSampler(fanouts=[self.rec_neigh_num, self.forward_neigh_num])
-                self.val_test_sampler = MyKNNMultiLayerNeighborSampler(fanouts=[self.forward_neigh_num])
-            else:
-                self.train_sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
-                self.val_test_sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
+        self.create_dgl_dataset()
+        self.dgl_indices = torch.arange(self.dgl_train_dataset[0].num_nodes(), device=self.dgl_device)
+        if self.forward_neigh_num:
+            # assert self.forward_neigh_num == self.rec_neigh_num
+            self.train_sampler = MyKNNMultiLayerNeighborSampler(fanouts=[self.rec_neigh_num, self.forward_neigh_num])
+            self.val_test_sampler = MyKNNMultiLayerNeighborSampler(fanouts=[self.forward_neigh_num])
+        else:
+            self.train_sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
+            self.val_test_sampler = dgl.dataloading.MultiLayerFullNeighborSampler(1)
         if self.batch_size == "all":
             self.batch_size = len(self.data_val.adata)
         self.train_drop_last = True if self.batch_size <= len(self.data_val.adata) else False
@@ -226,40 +234,40 @@ class GMVAEDataModule(pl.LightningDataModule):
             logging.info(self.data_train.adata)
 
     def train_dataloader(self):
-        if self.max_dynamic_neigh:
-            if self.recreate_dgl_dataset:
-                self.create_dgl_dataset()
+        if self.recreate_dgl_dataset:
+            self.create_dgl_dataset()
+        return DGLDataLoader(
+            self.dgl_train_dataset[0],
+            self.dgl_indices,
+            self.train_sampler,
+            device=self.dgl_device,
+            use_uva=self.use_uva,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            drop_last=self.train_drop_last,
+            shuffle=True,
+            use_ddp=self.use_ddp,
+            ddp_seed=self.seed,
+        )
+
+    def val_dataloader(self):
+        # print("start val_dataloader")
+        if self.forward_neigh_num:
             return DGLDataLoader(
                 self.dgl_train_dataset[0],
                 self.dgl_indices,
-                self.train_sampler,
+                self.val_test_sampler,
                 device=self.dgl_device,
                 use_uva=self.use_uva,
                 batch_size=self.batch_size,
                 num_workers=self.num_workers,
-                drop_last=self.train_drop_last,
-                persistent_workers=False,
-                use_prefetch_thread=False,
-                shuffle=True,
+                shuffle=False,
                 use_ddp=self.use_ddp,
+                ddp_seed=self.seed,
             )
         else:
-            return DataLoader(
-                dataset=self.data_train,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                persistent_workers=self.persistent_workers,
-                prefetch_factor=self.prefetch_factor,
-                pin_memory=self.pin_memory,
-                drop_last=self.train_drop_last,
-                shuffle=True,
-            )
-
-    def val_dataloader(self):
-        # print("start val_dataloader")
-        if self.max_dynamic_neigh:
-            if self.forward_neigh_num:
-                return DGLDataLoader(
+            if self.kept_val_dataloader is None:
+                self.kept_val_dataloader = DGLDataLoader(
                     self.dgl_train_dataset[0],
                     self.dgl_indices,
                     self.val_test_sampler,
@@ -267,42 +275,32 @@ class GMVAEDataModule(pl.LightningDataModule):
                     use_uva=self.use_uva,
                     batch_size=self.batch_size,
                     num_workers=self.num_workers,
-                    persistent_workers=False,
-                    use_prefetch_thread=False,
+                    persistent_workers=self.persistent_workers,
                     shuffle=False,
                     use_ddp=self.use_ddp,
+                    ddp_seed=self.seed,
                 )
-            else:
-                if self.kept_val_dataloader is None:
-                    self.kept_val_dataloader = DGLDataLoader(
-                        self.dgl_train_dataset[0],
-                        self.dgl_indices,
-                        self.val_test_sampler,
-                        device=self.dgl_device,
-                        use_uva=self.use_uva,
-                        batch_size=self.batch_size,
-                        num_workers=self.num_workers,
-                        persistent_workers=self.persistent_workers,
-                        shuffle=False,
-                        use_ddp=self.use_ddp,
-                    )
-        else:
-            self.kept_val_dataloader = DataLoader(
-                dataset=self.data_val,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                persistent_workers=self.persistent_workers,
-                prefetch_factor=self.prefetch_factor,
-                pin_memory=self.pin_memory,
-                shuffle=False,
-            )
+
         # print("stop val_dataloader")
         return self.kept_val_dataloader
 
     def test_dataloader(self):
-        if self.max_dynamic_neigh:
-            if self.forward_neigh_num:
-                return DGLDataLoader(
+        if self.forward_neigh_num:
+            return DGLDataLoader(
+                self.dgl_train_dataset[0],
+                self.dgl_indices,
+                self.val_test_sampler,
+                device=self.dgl_device,
+                use_uva=self.use_uva,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                shuffle=False,
+                use_ddp=self.use_ddp,
+                ddp_seed=self.seed,
+            )
+        else:
+            if self.kept_test_dataloader is None:
+                self.kept_test_dataloader = DGLDataLoader(
                     self.dgl_train_dataset[0],
                     self.dgl_indices,
                     self.val_test_sampler,
@@ -310,33 +308,9 @@ class GMVAEDataModule(pl.LightningDataModule):
                     use_uva=self.use_uva,
                     batch_size=self.batch_size,
                     num_workers=self.num_workers,
-                    persistent_workers=False,
-                    use_prefetch_thread=False,
+                    persistent_workers=self.persistent_workers,
                     shuffle=False,
                     use_ddp=self.use_ddp,
+                    ddp_seed=self.seed,
                 )
-            else:
-                if self.kept_test_dataloader is None:
-                    self.kept_test_dataloader = DGLDataLoader(
-                        self.dgl_train_dataset[0],
-                        self.dgl_indices,
-                        self.val_test_sampler,
-                        device=self.dgl_device,
-                        use_uva=self.use_uva,
-                        batch_size=self.batch_size,
-                        num_workers=self.num_workers,
-                        persistent_workers=self.persistent_workers,
-                        shuffle=False,
-                        use_ddp=self.use_ddp,
-                    )
-        else:
-            self.kept_test_dataloader = DataLoader(
-                dataset=self.data_test,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                persistent_workers=self.persistent_workers,
-                prefetch_factor=self.prefetch_factor,
-                pin_memory=self.pin_memory,
-                shuffle=False,
-            )
         return self.kept_test_dataloader

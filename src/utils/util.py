@@ -1,6 +1,6 @@
 import logging
 import numpy as np
-import time
+import networkx as nx
 import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm, trange
@@ -16,7 +16,6 @@ from sklearn.neighbors import NearestNeighbors
 from collections import defaultdict
 import warnings
 import torch.distributed as dist
-import networkx as nx
 
 # https://stackoverflow.com/questions/71433507/pytorch-python-distributed-multiprocessing-gather-concatenate-tensor-arrays-of
 def gather_nd_to_rank(tensor, axis=0, rank=0):
@@ -532,6 +531,158 @@ def log_exp_graph(
     )
     return gt_exp_graph_path, pred_exp_graph_path
 
+def log_umap_figure(
+    data_val,
+    latent,
+    log_path,
+    current_epoch,
+    gt_labels,
+    pred_labels,
+    plot_gt=True,
+    plot_pred=True,
+):
+    if data_val.full_adata:
+        adata = data_val.full_adata
+    else:
+        adata = data_val.adata
+    data_type = data_val.data_type
+    plot_annotation_key = "cell_type"
+    annotation_key = data_val.annotation_key
+    # if data_val.sample_id.startswith("GSM483813") or data_val.sample_id == "zebrafish_tumor":
+    #     scatter_size = 0.3
+    # else:
+    #     scatter_size = 0.1
+    # for seaborn
+    if data_val.sample_id.startswith("GSM483813") or data_val.sample_id == "zebrafish_tumor":
+        scatter_size = 0.3
+    else:
+        scatter_size = 0.3
+    reducer = umap.UMAP(n_components=2)
+    latent_umap = reducer.fit_transform(latent)
+    if plot_gt:
+        graph_type="gt_umap"
+        relative_path = "{}_{}.png".format(graph_type, current_epoch)
+        gt_umap_figure_path = osp.join(log_path, relative_path)
+
+        batch_graph_type="batch_umap"
+        batch_relative_path = "{}_{}.png".format(batch_graph_type, current_epoch)
+        batch_umap_figure_path = osp.join(log_path, batch_relative_path)
+
+        niche_graph_type="niche_umap"
+        niche_relative_path = "{}_{}.png".format(niche_graph_type, current_epoch)
+        niche_umap_figure_path = osp.join(log_path, niche_relative_path)
+
+        adata.obs["gt_labels"] = pd.Categorical(gt_labels)
+        scatter_df = pd.DataFrame(latent_umap, columns=["umap_0", "umap_1"])
+        if "annotation_colors" in adata.uns:
+            try:
+                scatter_df[f"{plot_annotation_key}"] = adata.obs[f"{plot_annotation_key}"].cat.rename_categories(adata.uns["annotation_colors"]).values
+            except:
+                # scatter_df[f"{annotation_key}"] = adata.obs[f"{annotation_key}"].map(dict(zip(adata.obs[f"{annotation_key}"].cat.categories, adata.uns["annotation_colors"])))
+                unique_color = set(adata.uns["annotation_colors"].tolist())
+                if len(unique_color) < len(adata.obs[f"{plot_annotation_key}"].cat.categories):
+                    if len(adata.obs[f"{plot_annotation_key}"].cat.categories) - len(unique_color) == 1:
+                        if "#ff000000" not in unique_color: # balck
+                            unique_color.add("#ff000000")
+                        elif "#ffffffff" not in unique_color: # white
+                            unique_color.add("#ffffffff")
+                        else:
+                            raise NotImplementedError
+                    elif len(adata.obs[f"{plot_annotation_key}"].cat.categories) - len(unique_color) == 2:
+                        assert "#ff000000" not in unique_color and "#ffffffff" not in unique_color
+                        unique_color.add("#ff000000")
+                        unique_color.add("#ffffffff")
+                    else:
+                        raise NotImplementedError
+                scatter_df[f"{plot_annotation_key}"] = adata.obs[f"{plot_annotation_key}"].cat.rename_categories(list(unique_color)).values
+        else:
+            # !!!!!
+            if pd.isna(adata.obs[f"{annotation_key}"]).sum() > 0:
+                tmp_anno_series = adata.obs[f"{plot_annotation_key}"].cat.add_categories("Unknown")
+                tmp_anno_series = tmp_anno_series.fillna("Unknown")
+            else:
+                tmp_anno_series = adata.obs[f"{plot_annotation_key}"]
+            # !!!!!
+            scatter_df[f"{plot_annotation_key}"] = tmp_anno_series.cat.rename_categories(COLOUR_DICT[:len(tmp_anno_series.value_counts())]).values
+        # color_map = dict(zip(range(len(scatter_df[f"{annotation_key}"].cat.categories)), scatter_df[f"{annotation_key}"].cat.categories))
+        # patches = [mpatches.Patch(color=v, label=k) for k, v in color_map.items()]
+        # scatter = plt.scatter(scatter_df["umap_0"], scatter_df["umap_1"], c=scatter_df[f"{annotation_key}"], s=scatter_size)
+        # plt.legend(handles=patches, loc="upper left", bbox_to_anchor=(0, -0.1), title=f"{annotation_key}", ncols=4)
+        sns.scatterplot(x=latent_umap[:, 0], y=latent_umap[:, 1], hue=adata.obs["cell_type"], s=scatter_size, palette=dict(zip(adata.obs["cell_type"].cat.categories, scatter_df[f"{plot_annotation_key}"].cat.categories)))
+        plt.legend(loc="upper left", bbox_to_anchor=(0, -0.1), title=f"{plot_annotation_key}", ncols=4)
+        plt.axis("equal")
+        if data_type == "10x":
+            plt.gca().invert_yaxis()
+        sc_fig = plt.gcf()
+        sc_fig.savefig(gt_umap_figure_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        if "fov" in adata.obs.keys():
+            sorted_unique_fov = np.sort(adata.obs["fov"].unique())
+            sns.scatterplot(x=latent_umap[:, 0], y=latent_umap[:, 1], hue=adata.obs["fov"], s=scatter_size, palette=dict(zip(sorted_unique_fov, COLOUR_DICT[:len(sorted_unique_fov)])))
+            plt.legend(loc="upper left", bbox_to_anchor=(0, -0.1), title="fov", ncols=4)
+            plt.axis("equal")
+            if data_type == "10x":
+                plt.gca().invert_yaxis()
+            sc_fig = plt.gcf()
+            sc_fig.savefig(batch_umap_figure_path, dpi=300, bbox_inches="tight")
+            plt.close()
+        if "niche" in adata.obs.keys():
+            sorted_unique_niche = np.sort(adata.obs["niche"].unique())
+            sns.scatterplot(x=latent_umap[:, 0], y=latent_umap[:, 1], hue=adata.obs["niche"], s=scatter_size, palette=dict(zip(sorted_unique_niche, COLOUR_DICT[:len(sorted_unique_niche)])))
+            plt.legend(loc="upper left", bbox_to_anchor=(0, -0.1), title="niche", ncols=4)
+            plt.axis("equal")
+            if data_type == "10x":
+                plt.gca().invert_yaxis()
+            sc_fig = plt.gcf()
+            sc_fig.savefig(niche_umap_figure_path, dpi=300, bbox_inches="tight")
+            plt.close()
+
+    else:
+        gt_umap_figure_path = None
+
+    if plot_pred:
+        graph_type="pred_umap"
+        relative_path = "{}_{}.png".format(graph_type, current_epoch)
+        pred_umap_figure_path = osp.join(log_path, relative_path)
+        adata.obs["plot_pred_labels"] = pd.Categorical(pred_labels)
+        scatter_df = pd.DataFrame(latent_umap, columns=["umap_0", "umap_1"])
+        pred_cluster_num = len(np.unique(pred_labels))
+        if "annotation_colors" in adata.uns:
+            try:
+                scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(adata.uns["annotation_colors"][:pred_cluster_num]).values
+            except:
+                # scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].map(dict(zip(adata.obs["plot_pred_labels"].cat.categories, adata.uns["annotation_colors"])))
+                unique_color = set(adata.uns["annotation_colors"].tolist())
+                if len(unique_color) < len(adata.obs[f"{annotation_key}"].cat.categories):
+                    if len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 1:
+                        if "#ff000000" not in unique_color: # balck
+                            unique_color.add("#ff000000")
+                        elif "#ffffffff" not in unique_color: # white
+                            unique_color.add("#ffffffff")
+                        else:
+                            raise NotImplementedError
+                    elif len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 2:
+                        assert "#ff000000" not in unique_color and "#ffffffff" not in unique_color
+                        unique_color.add("#ff000000")
+                        unique_color.add("#ffffffff")
+                    else:
+                        raise NotImplementedError
+                scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(list(unique_color)).values
+        else:
+            scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(COLOUR_DICT[:pred_cluster_num]).values
+        # scatter = plt.scatter(scatter_df["umap_0"], scatter_df["umap_1"], c=scatter_df[f"{annotation_key}"], s=scatter_size)
+        sns.scatterplot(x=latent_umap[:, 0], y=latent_umap[:, 1], hue=adata.obs["plot_pred_labels"], s=scatter_size, palette=dict(zip(adata.obs["plot_pred_labels"].cat.categories, scatter_df[f"{annotation_key}"].cat.categories)))
+        plt.legend(loc="upper left", bbox_to_anchor=(0, -0.1), title=f"{annotation_key}", ncols=4)
+        plt.axis("equal")
+        if data_type == "10x":
+            plt.gca().invert_yaxis()
+        sc_fig = plt.gcf()
+        sc_fig.savefig(pred_umap_figure_path, dpi=300, bbox_inches="tight")
+        plt.close()
+    else:
+        pred_umap_figure_path = None
+    # raise
+    return gt_umap_figure_path, pred_umap_figure_path
 
 def log_tissue_graph(
     data_val,
@@ -540,6 +691,7 @@ def log_tissue_graph(
     gt_labels,
     pred_labels,
     plot_gt=True,
+    plot_pred=True,
 ):
     """Wrapper function inside validation step, plot graph to disk.
 
@@ -558,6 +710,10 @@ def log_tissue_graph(
         adata = data_val.adata
     data_type = data_val.data_type
     annotation_key = data_val.annotation_key
+    if data_val.sample_id.startswith("GSM483813") or data_val.sample_id == "zebrafish_tumor":
+        scatter_size = 0.3
+    else:
+        scatter_size = 0.1
     if plot_gt:
         graph_type="gt_tissue"
         relative_path = "{}_{}.png".format(graph_type, current_epoch)
@@ -595,19 +751,18 @@ def log_tissue_graph(
                             raise NotImplementedError
                     scatter_df[f"{annotation_key}"] = adata.obs[f"{annotation_key}"].cat.rename_categories(list(unique_color)).values
             else:
-                tmp_anno_series = adata.obs[f"{annotation_key}"].cat.add_categories("Unknown")
-                tmp_anno_series = tmp_anno_series.fillna("Unknown")
+                if pd.isna(adata.obs[f"{annotation_key}"]).sum() > 0:
+                    tmp_anno_series = adata.obs[f"{annotation_key}"].cat.add_categories("Unknown")
+                    tmp_anno_series = tmp_anno_series.fillna("Unknown")
+                else:
+                    tmp_anno_series = adata.obs[f"{annotation_key}"]
                 scatter_df[f"{annotation_key}"] = tmp_anno_series.cat.rename_categories(COLOUR_DICT[:len(tmp_anno_series.value_counts())]).values
-            if data_val.sample_id.startswith("GSM483813") or data_val.sample_id == "zebrafish_tumor":
-                scatter_size = 0.3
-            else:
-                scatter_size = 0.1
             if adata.obsm["spatial"].shape[1] == 2:
-                plt.scatter(scatter_df["x"], scatter_df["y"], c=scatter_df[f"{annotation_key}"], s=scatter_size)
+                plt.scatter(scatter_df["x"], scatter_df["y"], c=scatter_df[f"{annotation_key}"].values, s=scatter_size)
             elif adata.obsm["spatial"].shape[1] == 3:
                 fig = plt.figure()
                 ax = fig.add_subplot(projection='3d')
-                ax.scatter(scatter_df["x"], scatter_df["y"], scatter_df["z"], c=scatter_df[f"{annotation_key}"], s=scatter_size)
+                ax.scatter(scatter_df["x"], scatter_df["y"], scatter_df["z"], c=scatter_df[f"{annotation_key}"].values, s=scatter_size)
             plt.axis("equal")
             if data_type == "10x":
                 plt.gca().invert_yaxis()
@@ -617,60 +772,59 @@ def log_tissue_graph(
     else:
         gt_tissue_graph_path = None
 
-    graph_type="pred_tissue"
-    relative_path = "{}_{}.png".format(graph_type, current_epoch)
-    pred_tissue_graph_path = osp.join(log_path, relative_path)
-    adata.obs["plot_pred_labels"] = pd.Categorical(pred_labels)
-    if data_type == "10x" and data_val.sample_id != "all" and (not data_val.sample_id.startswith("GSM483813")) and data_val.sample_id != "zebrafish_tumor" and adata.obsm["spatial"].shape[1] == 2:
-        # ax_dict = sc.pl.spatial(adata, img_key="hires", color="plot_pred_labels", show=False)
-        # ax_dict = sc.pl.spatial(adata, img_key="lowres", color="plot_pred_labels", alpha_img=0., show=False)
-        ax_dict = sc.pl.spatial(adata, img_key="lowres", color="plot_pred_labels", title=f"Epoch {current_epoch}", show=False)
-    else:
-        if adata.obsm["spatial"].shape[1] == 2:
-            scatter_df_cols = ["x", "y"]
-        elif adata.obsm["spatial"].shape[1] == 3:
-            scatter_df_cols = ["x", "y", "z"]
-        scatter_df = pd.DataFrame(adata.obsm["spatial"], columns=scatter_df_cols)
-        pred_cluster_num = len(np.unique(pred_labels))
-        if "annotation_colors" in adata.uns:
-            try:
-                scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(adata.uns["annotation_colors"][:pred_cluster_num]).values
-            except:
-                # scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].map(dict(zip(adata.obs["plot_pred_labels"].cat.categories, adata.uns["annotation_colors"])))
-                unique_color = set(adata.uns["annotation_colors"].tolist())
-                if len(unique_color) < len(adata.obs[f"{annotation_key}"].cat.categories):
-                    if len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 1:
-                        if "#ff000000" not in unique_color: # balck
+    if plot_pred:
+        graph_type="pred_tissue"
+        relative_path = "{}_{}.png".format(graph_type, current_epoch)
+        pred_tissue_graph_path = osp.join(log_path, relative_path)
+        adata.obs["plot_pred_labels"] = pd.Categorical(pred_labels)
+        if data_type == "10x" and data_val.sample_id != "all" and (not data_val.sample_id.startswith("GSM483813")) and data_val.sample_id != "zebrafish_tumor" and adata.obsm["spatial"].shape[1] == 2:
+            # ax_dict = sc.pl.spatial(adata, img_key="hires", color="plot_pred_labels", show=False)
+            # ax_dict = sc.pl.spatial(adata, img_key="lowres", color="plot_pred_labels", alpha_img=0., show=False)
+            ax_dict = sc.pl.spatial(adata, img_key="lowres", color="plot_pred_labels", title=f"Epoch {current_epoch}", show=False)
+        else:
+            if adata.obsm["spatial"].shape[1] == 2:
+                scatter_df_cols = ["x", "y"]
+            elif adata.obsm["spatial"].shape[1] == 3:
+                scatter_df_cols = ["x", "y", "z"]
+            scatter_df = pd.DataFrame(adata.obsm["spatial"], columns=scatter_df_cols)
+            pred_cluster_num = len(np.unique(pred_labels))
+            if "annotation_colors" in adata.uns:
+                try:
+                    scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(adata.uns["annotation_colors"][:pred_cluster_num]).values
+                except:
+                    # scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].map(dict(zip(adata.obs["plot_pred_labels"].cat.categories, adata.uns["annotation_colors"])))
+                    unique_color = set(adata.uns["annotation_colors"].tolist())
+                    if len(unique_color) < len(adata.obs[f"{annotation_key}"].cat.categories):
+                        if len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 1:
+                            if "#ff000000" not in unique_color: # balck
+                                unique_color.add("#ff000000")
+                            elif "#ffffffff" not in unique_color: # white
+                                unique_color.add("#ffffffff")
+                            else:
+                                raise NotImplementedError
+                        elif len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 2:
+                            assert "#ff000000" not in unique_color and "#ffffffff" not in unique_color
                             unique_color.add("#ff000000")
-                        elif "#ffffffff" not in unique_color: # white
                             unique_color.add("#ffffffff")
                         else:
                             raise NotImplementedError
-                    elif len(adata.obs[f"{annotation_key}"].cat.categories) - len(unique_color) == 2:
-                        assert "#ff000000" not in unique_color and "#ffffffff" not in unique_color
-                        unique_color.add("#ff000000")
-                        unique_color.add("#ffffffff")
-                    else:
-                        raise NotImplementedError
-                scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(list(unique_color)).values
-        else:
-            scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(COLOUR_DICT[:pred_cluster_num]).values
-        if data_val.sample_id.startswith("GSM483813") or data_val.sample_id == "zebrafish_tumor":
-            scatter_size = 0.3
-        else:
-            scatter_size = 0.1
-        if adata.obsm["spatial"].shape[1] == 2:
-            plt.scatter(scatter_df["x"], scatter_df["y"], c=scatter_df[f"{annotation_key}"], s=scatter_size)
-        elif adata.obsm["spatial"].shape[1] == 3:
-            fig = plt.figure()
-            ax = fig.add_subplot(projection='3d')
-            ax.scatter(scatter_df["x"], scatter_df["y"], scatter_df["z"], c=scatter_df[f"{annotation_key}"], s=scatter_size)
-        plt.axis("equal")
-        if data_type == "10x":
-            plt.gca().invert_yaxis()
-    sc_fig = plt.gcf()
-    sc_fig.savefig(pred_tissue_graph_path, dpi=300, bbox_inches="tight")
-    plt.close()
+                    scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(list(unique_color)).values
+            else:
+                scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(COLOUR_DICT[:pred_cluster_num]).values
+            if adata.obsm["spatial"].shape[1] == 2:
+                plt.scatter(scatter_df["x"], scatter_df["y"], c=scatter_df[f"{annotation_key}"].values, s=scatter_size)
+            elif adata.obsm["spatial"].shape[1] == 3:
+                fig = plt.figure()
+                ax = fig.add_subplot(projection='3d')
+                ax.scatter(scatter_df["x"], scatter_df["y"], scatter_df["z"], c=scatter_df[f"{annotation_key}"].values, s=scatter_size)
+            plt.axis("equal")
+            if data_type == "10x":
+                plt.gca().invert_yaxis()
+        sc_fig = plt.gcf()
+        sc_fig.savefig(pred_tissue_graph_path, dpi=300, bbox_inches="tight")
+        plt.close()
+    else:
+        pred_tissue_graph_path = None
 
     return gt_tissue_graph_path, pred_tissue_graph_path
 
@@ -686,6 +840,14 @@ def get_domain_boundary_unit_indices(adata, domain_idx, domain_key="pred_labels"
                                              ).sum(1) != adata.obsm[neighbor_key].shape[1])[0]
     domain_boundary_unit_indices = this_domain_unit_num_indices[domain_boundary_unit_indices]
     return domain_boundary_unit_indices
+
+def bincount2d(arr, bins=None):
+    if bins is None:
+        bins = np.max(arr) + 1
+    count = np.zeros(shape=[len(arr), bins], dtype=np.int64)
+    indexing = (np.ones_like(arr).T * np.arange(len(arr))).T
+    np.add.at(count, (indexing, arr), 1)
+    return count
 
 # https://stackoverflow.com/questions/40591754/vectorizing-numpy-bincount
 def batched_bincount_for_row(x):
@@ -738,36 +900,36 @@ def int2onehot(x):
 #         new_row[geneptr] += 1
 #     return new_row
 
-# @numba.njit(parallel=True, cache=True)
-# @numba.jit(forceobj=True)
-# @numba.jit
-@numba.jit(cache=True)
-def downsample_array(
-    one_row: np.ndarray,
-    target: int,
-    rng=None,
-    replace: bool = True,
-):
-    """\
-    Evenly reduce/increase counts in cell to target amount.
-    """
-    cumcounts = np.cumsum(one_row)
-    new_row = np.zeros_like(one_row)
-    total = np.int_(cumcounts[-1])
-    sample = np.random.choice(total, target, replace=replace)
-    sample.sort()
-    geneptr = 0
-    for count in sample:
-        while count >= cumcounts[geneptr]:
-            geneptr += 1
-        new_row[geneptr] += 1
-    return new_row
+# # @numba.njit(parallel=True, cache=True)
+# # @numba.jit(forceobj=True)
+# # @numba.jit
+# @numba.jit(cache=True)
+# def downsample_array(
+#     one_row: np.ndarray,
+#     target: int,
+#     rng=None,
+#     replace: bool = True,
+# ):
+#     """\
+#     Evenly reduce/increase counts in cell to target amount.
+#     """
+#     cumcounts = np.cumsum(one_row)
+#     new_row = np.zeros_like(one_row)
+#     total = np.int_(cumcounts[-1])
+#     sample = np.random.choice(total, target, replace=replace)
+#     sample.sort()
+#     geneptr = 0
+#     for count in sample:
+#         while count >= cumcounts[geneptr]:
+#             geneptr += 1
+#         new_row[geneptr] += 1
+#     return new_row
 
-def resample_per_cell(X, target, rng, replace=True):
-    new_X = np.empty_like(X)
-    for i in range(X.shape[0]):
-        new_X[i] = downsample_array(X[i], target, rng, replace)
-    return new_X
+# def resample_per_cell(X, target, rng, replace=True):
+#     new_X = np.empty_like(X)
+#     for i in range(X.shape[0]):
+#         new_X[i] = downsample_array(X[i], target, rng, replace)
+#     return new_X
 
 def describe_graph(graph_type: str, graph: nx.Graph):
     graph_nodes = graph.number_of_nodes()

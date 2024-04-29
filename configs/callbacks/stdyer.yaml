@@ -1,3 +1,19 @@
+model_checkpoint:
+  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  monitor: "epoch" # name of the logged metric which determines when model is improving
+  mode: "max" # "max" means higher metric value is better, can be also "min"
+  save_top_k: -1 # save k best models (determined by above metric)
+  every_n_epochs: 50 #5 # save model every n epochs
+  # save_last: True # additionaly always save model from last epoch
+  verbose: False
+  # dirpath: ${paths.exp_log_dir}/checkpoints
+  # dirpath: "${paths.log_dir}/checkpoints"
+  dirpath: "${model.log_path}/checkpoints"
+  # dirpath: null
+  filename: "epoch_{epoch:d}"
+  auto_insert_metric_name: False
+  save_on_train_epoch_end: True
+
 model_summary:
   _target_: pytorch_lightning.callbacks.RichModelSummary
   max_depth: 1

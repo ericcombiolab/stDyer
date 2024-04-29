@@ -16,6 +16,7 @@ exp_log_dir: "${paths.log_root_dir}/experiments"
 # path generation pattern is specified in `configs/hydra/default.yaml`
 # use it to store all files generated during the run, like ckpts and metrics
 output_dir: ${hydra:runtime.output_dir}
+# output_dir: "${paths.log_root_dir}/hydra"
 
 # path to working directory
 work_dir: ${hydra:runtime.cwd}

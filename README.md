@@ -36,7 +36,10 @@ Train model with chosen experiment configuration from [configs/experiment/](conf
 python run.py experiment=example.yaml
 ```
 
-The predicted spatial domain labels will be saved to logs/logger_logs folder.
+The predicted spatial domain labels will be saved to anndata(.h5ad) files in logs/logger_logs folder. The raw predicted spatial domain labels is in adata.obs["pred_labels"]. The autoencoder refined labels is in adata.obs["mlp_fit"].
+
+
+The detected spatially variable genes will be saved in adata.uns["svg_dict"].
 
 You can override any parameter from command line like this
 

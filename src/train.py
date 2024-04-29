@@ -67,7 +67,8 @@ def train(config: DictConfig) -> Optional[float]:
 
     # Init lightning callbacks
     if "model_checkpoint" in config.callbacks:
-        config.callbacks.model_checkpoint.dirpath = osp.join(config.paths.log_dir, f"{logger[0].version}/checkpoints")
+        if "dirpath" in config.callbacks.model_checkpoint and config.callbacks.model_checkpoint.dirpath is None:
+            config.callbacks.model_checkpoint.dirpath = osp.join(config.paths.log_dir, f"{logger[0].version}/checkpoints")
     callbacks: List[Callback] = []
     if "callbacks" in config:
         for _, cb_conf in config.callbacks.items():
@@ -84,7 +85,7 @@ def train(config: DictConfig) -> Optional[float]:
     trainer: Trainer = hydra.utils.instantiate(
         # config.trainer, callbacks=callbacks, logger=logger, precision=16, profiler=profiler, _convert_="partial"
         # config.trainer, callbacks=callbacks, logger=logger, precision="bf16", _convert_="partial"
-        config.trainer, callbacks=callbacks, logger=logger, precision=16, reload_dataloaders_every_n_epochs=reload_dataloader, _convert_="partial"
+        config.trainer, callbacks=callbacks, logger=logger, precision="16-mixed", reload_dataloaders_every_n_epochs=reload_dataloader, _convert_="partial"
         # config.trainer, callbacks=callbacks, logger=logger, precision=16, reload_dataloaders_every_n_epochs=reload_dataloader, _convert_="partial", profiler=profiler
     )
     # tuner = Tuner(trainer)

@@ -5,6 +5,7 @@ dataset_dir: "MOSTA"
 data_type: "bgi"
 sample_id: "E16.5_E2S7.MOSTA"
 multi_slides: False
+annotation_key: null
 
 weighted_neigh: False
 dynamic_neigh_level: "unit_fix_domain_boundary"

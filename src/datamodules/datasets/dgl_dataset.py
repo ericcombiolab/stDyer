@@ -5,6 +5,8 @@ import dgl
 import torch
 import gc
 from src.utils.states import Dynamic_neigh_level
+# import time
+# from sklearn.neighbors import NearestNeighbors
 
 # import logging
 # import scipy
@@ -13,9 +15,7 @@ from src.utils.states import Dynamic_neigh_level
 # import pandas as pd
 # from os import path as osp
 # import os
-# from sklearn.neighbors import NearestNeighbors
 # from memory_profiler import profile
-# import time
 
 class MyDGLDataset(DGLDataset):
     """Graph dataset object, loading dataset in a batch-wise manner.

@@ -7,6 +7,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import CometLogger
 import numpy as np
 import torch
+from captum.attr import IntegratedGradients
 
 from torch.nn import functional as F
 from torch.nn import CrossEntropyLoss
@@ -14,10 +15,12 @@ from torch.optim import Adam, AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts, LambdaLR, CyclicLR, OneCycleLR
 from dgl import NID
 from sklearn.metrics import *
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import MinMaxScaler
 from src.models.modules.gmgat import VAE
 from src.models.losses import LossFunctions
 from src.utils.util import *
-from sklearn.cluster import kmeans_plusplus
+import scipy
 from scipy.spatial.distance import cdist
 import time
 from datetime import datetime
@@ -114,7 +117,7 @@ class GMVGAT(pl.LightningModule):
         patience_start_epoch_pct=0.,
         patience_diff_pct=0.01,
         dynamic_neigh_quantile=0.5,
-        use_pseudo_labels=False,
+        min_cluster_size=100,
         detect_anomaly=False,
         clip_value=0.0,
         clip_type="norm",
@@ -125,9 +128,15 @@ class GMVGAT(pl.LightningModule):
         add_cat_bias=False,
         force_enough_classes=False,
         inbalance_weight=False,
+        exceed_int_max_batch_size=10240,
+        refine_ae_channels=None,
+        detect_svg=False,
+        separate_backward=False,
+        automatic_optimization=True,
         verbose_loss=False,
         legacy=False,
         debug=False,
+        **kwargs,
     ):
         super().__init__()
         torch.autograd.set_detect_anomaly(detect_anomaly)
@@ -160,6 +169,11 @@ class GMVGAT(pl.LightningModule):
         else:
             self.exp_decoder_in_channels = self.exp_decoder_channels[:-1]
             self.exp_decoder_out_channels = self.exp_decoder_channels[1:]
+        self.refine_ae_channels = refine_ae_channels
+        self.detect_svg = detect_svg
+        if self.detect_svg is True:
+            self.detect_svg = 50
+
         if gaussian_size is None:
             self.gaussian_size = self.exp_encoder_out_channels[-1]
         else:
@@ -185,13 +199,13 @@ class GMVGAT(pl.LightningModule):
         self.lr_scheduler = lr_scheduler
         self.cyclic_gamma = cyclic_gamma
         self.T_max = T_max
+        self.min_cluster_size = min_cluster_size
 
         self.log_base_path = log_path
         self.plot_graph_size = plot_graph_size
         self.exp_rec_type = exp_rec_type
         self.detect_anomaly = detect_anomaly
-        # self.automatic_optimization = False
-        self.automatic_optimization = True
+        self.automatic_optimization = automatic_optimization
         self.weight_decay = weight_decay
         self.highest_exp_ARI = -1
         self.clip_value = clip_value
@@ -217,7 +231,6 @@ class GMVGAT(pl.LightningModule):
         self.patience_start_epoch_pct = float(patience_start_epoch_pct)
         self.patience_diff_pct = float(patience_diff_pct)
         self.dynamic_neigh_quantile = float(dynamic_neigh_quantile)
-        self.use_pseudo_labels = use_pseudo_labels
         self.prior = prior
         self.GMM_model_name = GMM_model_name
         self.gaussian_kind = gaussian_kind
@@ -227,7 +240,10 @@ class GMVGAT(pl.LightningModule):
         self.add_cat_bias = add_cat_bias
         self.force_enough_classes = force_enough_classes
         self.inbalance_weight = inbalance_weight
-
+        self.separate_backward = separate_backward
+        if self.separate_backward:
+            raise NotImplementedError
+            self.automatic_optimization = False
         self.last_epoch_exp_pred_df = None
         self.last_epoch_ARI = -1
         self.setup_num = 0
@@ -236,6 +252,8 @@ class GMVGAT(pl.LightningModule):
         self.force_add_prob_cat_domain = None
         self.stop_cluster_init = False
         self.is_mu_prior_learnable = False
+        self.exceed_int_max = False
+        self.exceed_int_max_batch_size = exceed_int_max_batch_size
         self.training_step_outputs = collections.defaultdict(list)
         self.validation_step_outputs = collections.defaultdict(list)
         self.verbose_loss = verbose_loss
@@ -268,12 +286,11 @@ class GMVGAT(pl.LightningModule):
             self.num_cells = len(self.trainer.datamodule.data_val.adata)
             self.max_dynamic_neigh = self.trainer.datamodule.max_dynamic_neigh
             self.rec_mask_neigh_threshold = self.trainer.datamodule.rec_mask_neigh_threshold
-            if self.max_dynamic_neigh:
-                self.dynamic_neigh_level = self.trainer.datamodule.data_val.dynamic_neigh_level
-                if self.exp_neigh_w == "auto":
-                    self.exp_neigh_ws = torch.tensor(self.trainer.datamodule.data_val.dynamic_neigh_nums, dtype=torch.float32, device=self.data_device)
-                else:
-                    self.exp_neigh_ws = torch.tensor([self.exp_neigh_w] * len(self.trainer.datamodule.data_val.dynamic_neigh_nums), dtype=torch.float32, device=self.data_device)
+            self.dynamic_neigh_level = self.trainer.datamodule.data_val.dynamic_neigh_level
+            if self.exp_neigh_w == "auto":
+                self.exp_neigh_ws = torch.tensor(self.trainer.datamodule.data_val.dynamic_neigh_nums, dtype=torch.float32, device=self.data_device)
+            else:
+                self.exp_neigh_ws = torch.tensor([self.exp_neigh_w] * len(self.trainer.datamodule.data_val.dynamic_neigh_nums), dtype=torch.float32, device=self.data_device)
             self.supervise_cat = self.trainer.datamodule.supervise_cat
             self.seed = self.trainer.datamodule.seed
             if 'is_labelled' in self.trainer.datamodule.data_val.adata.obs.keys():
@@ -285,7 +302,10 @@ class GMVGAT(pl.LightningModule):
             if self.plot_graph_size == "all":
                 self.plot_graph_size = self.num_cells
             self.rng = np.random.default_rng(seed=self.seed)
-            self.plot_node_idx = self.rng.choice(self.num_cells, size=self.plot_graph_size, replace=False)
+            if self.plot_graph_size > self.num_cells:
+                self.plot_node_idx = np.arange(self.num_cells)
+            else:
+                self.plot_node_idx = self.rng.choice(self.num_cells, size=self.plot_graph_size, replace=False)
             self.rec_neigh_num = self.trainer.datamodule.rec_neigh_num
             if self.rec_neigh_num == 'half':
                 self.rec_neigh_num = self.trainer.datamodule.k // 2
@@ -346,8 +366,6 @@ class GMVGAT(pl.LightningModule):
                 print(type(self.prior))
                 print(self.prior)
                 raise NotImplementedError
-            if self.use_pseudo_labels:
-                assert self.rec_neigh_num
             self.time_dict = {"begin": time.time(), "end": time.time()}
         else:
             pass
@@ -379,7 +397,6 @@ class GMVGAT(pl.LightningModule):
         y_mus, y_logvars, y_var_invs = mix_y_mus, mix_y_logvars, mix_y_var_invs
         # print("output_nodes_idx", output_nodes_idx.shape)
         mus, logvars = mix_mus[:, output_nodes_idx, :], mix_logvars[:, output_nodes_idx, :]
-        ref_attr = rec_neigh_attr[output_nodes_idx]
         loss_rec_dict = self.losses.batch_reconstruction_loss(x, x_rec, prob_cat, rec_mask=exp_rec_mask, rec_type=self.exp_rec_type, verbose=self.verbose_loss)
         del x_rec
         if self.inbalance_weight:
@@ -445,11 +462,11 @@ class GMVGAT(pl.LightningModule):
                     else:
                         tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), rec_type=self.exp_rec_type, real_origin=x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), affi_weights=neigh_affi, verbose=self.verbose_loss)
                     del neigh_x_rec
-                    tmp_neigh_loss_rec = tmp_neigh_loss_rec_dict["loss"].view(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[j]
+                    tmp_neigh_loss_rec = tmp_neigh_loss_rec_dict["loss"].reshape(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[j]
                     del tmp_neigh_loss_rec_dict
                     neigh_loss_rec.append(tmp_neigh_loss_rec)
                     tmp_neigh_loss_gauss_dict = self.losses.batch_expected_gaussian_loss(neigh_prob_cat, neigh_mus, neigh_logvars, neigh_y_mus, neigh_y_logvars, affi_weights=neigh_affi, y_var_invs=neigh_y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
-                    tmp_neigh_loss_gauss = tmp_neigh_loss_gauss_dict["loss"].view(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[j]
+                    tmp_neigh_loss_gauss = tmp_neigh_loss_gauss_dict["loss"].reshape(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[j]
                     del tmp_neigh_loss_gauss_dict, neigh_mus, neigh_logvars
                     neigh_loss_gauss.append(tmp_neigh_loss_gauss)
             elif self.dynamic_neigh_level == Dynamic_neigh_level.unit or self.dynamic_neigh_level == Dynamic_neigh_level.unit_freq_self:
@@ -491,11 +508,11 @@ class GMVGAT(pl.LightningModule):
                     else:
                         tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), rec_type=self.exp_rec_type, real_origin=x[this_cluster_node_idx].repeat_interleave(dynamic_neigh_num, dim=0), affi_weights=neigh_affi, verbose=self.verbose_loss)
                     del neigh_x_rec
-                    tmp_neigh_loss_rec = tmp_neigh_loss_rec_dict["loss"].view(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[output_nodes_idx][this_cluster_node_idx]
+                    tmp_neigh_loss_rec = tmp_neigh_loss_rec_dict["loss"].reshape(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[output_nodes_idx][this_cluster_node_idx]
                     del tmp_neigh_loss_rec_dict
                     neigh_loss_rec.append(tmp_neigh_loss_rec)
                     tmp_neigh_loss_gauss_dict = self.losses.batch_expected_gaussian_loss(neigh_prob_cat, neigh_mus, neigh_logvars, neigh_y_mus, neigh_y_logvars, affi_weights=neigh_affi, y_var_invs=neigh_y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
-                    tmp_neigh_loss_gauss = tmp_neigh_loss_gauss_dict["loss"].view(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[output_nodes_idx][this_cluster_node_idx]
+                    tmp_neigh_loss_gauss = tmp_neigh_loss_gauss_dict["loss"].reshape(-1, dynamic_neigh_num).sum(-1) * self.exp_neigh_ws[output_nodes_idx][this_cluster_node_idx]
                     del tmp_neigh_loss_gauss_dict, neigh_mus, neigh_logvars
                     neigh_loss_gauss.append(tmp_neigh_loss_gauss)
             elif self.dynamic_neigh_level == Dynamic_neigh_level.unit_fix_domain or self.dynamic_neigh_level == Dynamic_neigh_level.unit_fix_domain_boundary or self.dynamic_neigh_level == Dynamic_neigh_level.unit_domain_boundary:
@@ -503,7 +520,19 @@ class GMVGAT(pl.LightningModule):
                 # dynamic neigh idx in original adata: flatten(B x K)
                 dynamic_neigh_idx = used_k.flatten()
                 # dynamic neigh idx in batch: flatten(B x K)
-                batch_dynamic_neigh_idx = torch.nonzero(input_nodes == torch.from_numpy(dynamic_neigh_idx).to(input_nodes).unsqueeze(1))[:, 1] #.reshape(-1, dynamic_neigh_num)
+                if not self.exceed_int_max:
+                    try:
+                        batch_dynamic_neigh_idx = torch.nonzero(input_nodes == torch.from_numpy(dynamic_neigh_idx).to(input_nodes).unsqueeze(1))[:, 1] #.reshape(-1, dynamic_neigh_num)
+                    except RuntimeError:
+                        self.exceed_int_max = True
+                if self.exceed_int_max:
+                    comparison = (input_nodes == torch.from_numpy(dynamic_neigh_idx).to(input_nodes).unsqueeze(1))
+                    batch_dynamic_neigh_idx = []
+                    for i in range(0, len(comparison), self.exceed_int_max_batch_size):  # Adjust the step size as needed
+                        temp = comparison[i:i + self.exceed_int_max_batch_size]
+                        batch_dynamic_neigh_idx.append(temp.nonzero(as_tuple=True)[1])
+                    batch_dynamic_neigh_idx = torch.cat(batch_dynamic_neigh_idx)
+
                 neigh_x_rec = {}
                 for dic_k, dic_v in mix_x_rec.items():
                     # dic_v.shape: (C, A, D)
@@ -571,182 +600,16 @@ class GMVGAT(pl.LightningModule):
         }
         return loss_dict, neigh_loss_dict
 
-    def gmvae_loss(self, x, out_net, exp_rec_mask=None, neigh_out_net=None, neigh_affi=None, cat=None, rec_cat=None, no_log=False):
-        # with detect_anomaly():
-        neigh_loss_dict = {"reconstruction": 0., "gaussian": 0., "categorical": 0.}
-        debug_dict = None
-        zs, x_rec = out_net["gaussians"], out_net["reconstructed"]
-        # logits, prob_cat, y = out_net['logits'], out_net['prob_cat'], out_net['categorical']
-        logits, prob_cat = out_net['logits'], out_net['prob_cat']
-        # print("prob_cat", prob_cat.shape)
-        if self.supervise_cat:
-            loss_sup_cat = CrossEntropyLoss()(logits, cat)
-        # print("prob_cat", prob_cat.shape)
-        y_mus, y_logvars, y_var_invs = out_net["y_means"], out_net["y_logvars"], out_net["y_var_invs"]
-        mus, logvars = out_net["means"], out_net["logvars"]
-        # self.time_dict["fetch_loss_data"] = time.time()
-        # print("Time for fetching loss data: ", self.time_dict["fetch_loss_data"] - self.time_dict["forward"])
-        # loss_rec, debug_dict = self.losses.batch_reconstruction_loss(x, x_rec, prob_cat, rec_type, debug=True)
-        loss_rec_dict = self.losses.batch_reconstruction_loss(x, x_rec, prob_cat, rec_mask=exp_rec_mask, rec_type=self.exp_rec_type, verbose=self.verbose_loss)
-        loss_gauss_dict = self.losses.batch_expected_gaussian_loss(prob_cat, mus, logvars, y_mus, y_logvars, affi_weights=None, y_var_invs=y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
-        loss_rec = loss_rec_dict["loss"].mean()
-        loss_gauss = loss_gauss_dict["loss"].mean()
-        loss_cat = self.losses.batch_expected_categorical_loss(prob_cat, affi_weights=None, prior=self.prior, learned_prior=self.updated_prior)
-        if self.verbose_loss:
-            self.training_step_outputs["cluster_loss_rec"].append(loss_rec_dict["cluster_loss"].detach().cpu().numpy())
-            self.training_step_outputs["weighted_cluster_loss_rec"].append(loss_rec_dict["weighted_cluster_loss"].detach().cpu().numpy())
-            self.training_step_outputs["cluster_loss_gauss"].append(loss_gauss_dict["cluster_loss"].detach().cpu().numpy())
-            self.training_step_outputs["weighted_cluster_loss_gauss"].append(loss_gauss_dict["weighted_cluster_loss"].detach().cpu().numpy())
-        if neigh_affi is not None:
-            all_neigh_affi = neigh_affi.view(-1)
-        else:
-            all_neigh_affi = None
-            curr_neigh_affi = None
-        if neigh_out_net is not None:
-        # if neigh_x is not None:
-            # B, K, G = neigh_x.shape
-            neigh_loss_rec = 0.
-            neigh_loss_gauss = 0.
-            neigh_loss_cat = 0.
-            neigh_loss_sup_cat = 0.
-            for k in range(self.rec_neigh_num):
-                if neigh_affi is not None:
-                    curr_neigh_affi = neigh_affi[:, k]
-                neigh_zs, neigh_x_rec = neigh_out_net["gaussians"][k], {key: neigh_out_net["reconstructed"][key][k] for key in neigh_out_net["reconstructed"].keys()}
-                # neigh_logits, neigh_prob_cat, neigh_y = neigh_out_net['logits'][k], neigh_out_net['prob_cat'][k], neigh_out_net['categorical'][k]
-                neigh_logits, neigh_prob_cat = neigh_out_net['logits'][k], neigh_out_net['prob_cat'][k]
-                # print("neigh_prob_cat", neigh_prob_cat.shape)
-                # print("rec_cat", rec_cat.shape)
-                # print("neigh_prob_cat", neigh_prob_cat.shape)
-                neigh_y_mus, neigh_y_logvars = neigh_out_net["y_means"][k], neigh_out_net["y_logvars"][k]
-                if neigh_out_net["y_var_invs"] != []:
-                    neigh_y_var_invs = neigh_out_net["y_var_invs"][k]
-                else:
-                    neigh_y_var_invs = None
-                neigh_mus, neigh_logvars = neigh_out_net["means"][k], neigh_out_net["logvars"][k]
-                tmp_neigh_loss_rec_dict = self.losses.batch_reconstruction_loss(x, neigh_x_rec, neigh_prob_cat, rec_mask=exp_rec_mask, rec_type=self.exp_rec_type, real_origin=x, affi_weights=curr_neigh_affi, verbose=self.verbose_loss)
-                tmp_neigh_loss_gauss_dict = self.losses.batch_expected_gaussian_loss(neigh_prob_cat, neigh_mus, neigh_logvars, neigh_y_mus, neigh_y_logvars, affi_weights=curr_neigh_affi, y_var_invs=neigh_y_var_invs, verbose=self.verbose_loss, kind=self.gaussian_kind)
-                if self.prior != "average_uniform_all_neighbors":
-                    tmp_neigh_loss_cat = self.losses.batch_expected_categorical_loss(neigh_prob_cat, affi_weights=curr_neigh_affi, prior=self.prior, learned_prior=self.updated_prior)
-                tmp_neigh_loss_rec = tmp_neigh_loss_rec_dict["loss"]
-                neigh_loss_rec += tmp_neigh_loss_rec.mean()
-                neigh_loss_gauss += tmp_neigh_loss_gauss_dict["loss"].mean()
-                if self.prior != "average_uniform_all_neighbors":
-                    neigh_loss_cat += tmp_neigh_loss_cat
-                if self.supervise_cat:
-                    tmp_neigh_loss_sup_cat = CrossEntropyLoss()(neigh_logits, rec_cat[:, k]) / self.rec_neigh_num
-                    neigh_loss_sup_cat += tmp_neigh_loss_sup_cat
-            if self.prior == "average_uniform_all_neighbors":
-                neigh_loss_cat = self.losses.batch_expected_categorical_loss(torch.stack(neigh_out_net['prob_cat'], 1).view(-1, neigh_prob_cat.shape[-1]), affi_weights=all_neigh_affi, prior=self.prior, learned_prior=self.updated_prior)
-            # self.time_dict["neigh_loss"] = time.time()
-            # print("Time for computing neighbor loss: ", self.time_dict["neigh_loss"] - self.time_dict["init_loss"])
-
-            if self.weighted_neigh:
-                pass
-            else:
-                neigh_loss_rec /= self.rec_neigh_num
-                neigh_loss_gauss /= self.rec_neigh_num
-            if self.prior == "average_uniform_all_neighbors":
-                pass
-            elif self.prior == "average_uniform":
-                neigh_loss_cat /= self.rec_neigh_num
-            else:
-                raise
-            if self.supervise_cat:
-                neigh_loss_cat = neigh_loss_sup_cat
-            neigh_loss_total = self.exp_neigh_w_rec * neigh_loss_rec + self.exp_neigh_w_gauss * neigh_loss_gauss + self.exp_neigh_w_cat * neigh_loss_cat
-            # self.time_dict["loss_sum"] = time.time()
-            # print("Time for summing loss: ", self.time_dict["loss_sum"] - self.time_dict["neigh_loss"])
-            neigh_loss_dict = {
-                "total": neigh_loss_total,
-                "reconstruction": neigh_loss_rec * self.exp_neigh_w_rec,
-                "gaussian": neigh_loss_gauss * self.exp_neigh_w_gauss,
-                "categorical": neigh_loss_cat * self.exp_neigh_w_cat,
-            }
-
-        # print("loss_rec", loss_rec)
-        # print("loss_gauss", loss_gauss)
-        # print("loss_cat", loss_cat)
-        # print("neigh_loss_rec", neigh_loss_rec)
-        # print("neigh_loss_gauss", neigh_loss_gauss)
-        # print("neigh_loss_cat", neigh_loss_cat)
-        if self.supervise_cat:
-            loss_cat = loss_sup_cat
-        loss_total = self.exp_w_rec * loss_rec + self.exp_w_gauss * loss_gauss + self.exp_w_cat * loss_cat
-
-        loss_dict = {
-            "total": loss_total,
-            "reconstruction": loss_rec * self.exp_w_rec,
-            "gaussian": loss_gauss * self.exp_w_gauss,
-            "categorical": loss_cat * self.exp_w_cat,
-            "logits": logits,
-            # "debug_dict": debug_dict,
-        }
-
-        return loss_dict, neigh_loss_dict
-
     # @profile
-    def get_forward_outputs(self, exp_attr, forward_neigh_attr, rec_neigh_attr, rec_forward_neigh_attr):
-        if not self.forward_neigh_num:
-            exp_output_dict = self.EXPGMGAT(
-                x=exp_attr,
-            )
-            # if self.rec_neigh_num and forward_neigh_attr is not None: # the rhs is for the case when we want to use semi_sup_rec_loss
-            if self.rec_neigh_num:
-                if self.max_dynamic_neigh:
-                    return exp_output_dict, None
-                else:
-                    # B x K1 x G
-                    # B, K, G = rec_neigh_attr.shape
-                    # print("B, K, G", B, K, G)
-                    # assert B % K == 0
-                    neighbor_output_dict = collections.defaultdict(list)
-                    for k in range(self.rec_neigh_num):
-                        neighbor_temp_dict = self.EXPGMGAT(
-                            x=rec_neigh_attr[:, k, :],
-                        )
-                        for key in neighbor_temp_dict:
-                            if isinstance(neighbor_temp_dict[key], torch.Tensor):
-                                neighbor_output_dict[key].append(neighbor_temp_dict[key])
-                            elif isinstance(neighbor_temp_dict[key], dict):
-                                if key not in neighbor_output_dict:
-                                    neighbor_output_dict[key] = collections.defaultdict(list)
-                                for subkey in neighbor_temp_dict[key]:
-                                    neighbor_output_dict[key][subkey].append(neighbor_temp_dict[key][subkey])
-            else:
-                return exp_output_dict, None
-            return exp_output_dict, neighbor_output_dict
-        else:
-            if self.max_dynamic_neigh:
-                exp_output_dict = self.EXPGMGAT(
-                    x=exp_attr,
-                )
-            else:
-                exp_output_dict = self.EXPGMGAT(
-                    x=exp_attr,
-                    neighbor_x=forward_neigh_attr,
-                )
-                if self.rec_neigh_num:
-                    # B x K1 x K2 x G
-                    # B, K1, K2, G = rec_forward_neigh_attr.shape
-                    neighbor_output_dict = collections.defaultdict(list)
-                    for k in range(self.rec_neigh_num):
-                        neighbor_temp_dict = self.EXPGMGAT(
-                            x=rec_neigh_attr[:, k, :],
-                            neighbor_x=rec_forward_neigh_attr[:, k, :, :],
-                        )
-                        for key in neighbor_temp_dict:
-                            if isinstance(neighbor_temp_dict[key], torch.Tensor):
-                                neighbor_output_dict[key].append(neighbor_temp_dict[key])
-                            elif isinstance(neighbor_temp_dict[key], dict):
-                                if key not in neighbor_output_dict:
-                                    neighbor_output_dict[key] = collections.defaultdict(list)
-                                for subkey in neighbor_temp_dict[key]:
-                                    neighbor_output_dict[key][subkey].append(neighbor_temp_dict[key][subkey])
-                    return exp_output_dict, neighbor_output_dict
-            return exp_output_dict, None
+    def get_forward_outputs(self, exp_attr):
+        exp_output_dict = self.EXPGMGAT(
+            x=exp_attr,
+        )
+        if self.force_enough_classes:
+            exp_output_dict = self.add_prob_cat(exp_output_dict)
+        return exp_output_dict
 
-    def add_prob_cat(self, exp_output_dict, neighbor_output_dict):
+    def add_prob_cat(self, exp_output_dict):
         if self.force_add_prob_cat_domain is not None:
             # # !!!!
             # self.prob_cat_to_add = self.prob_cat_to_add * self.num_classes
@@ -754,10 +617,6 @@ class GMVGAT(pl.LightningModule):
             if exp_output_dict is not None:
                 exp_output_dict["prob_cat"] = exp_output_dict["prob_cat"] + self.prob_cat_to_add
                 exp_output_dict["prob_cat"] = exp_output_dict["prob_cat"] / exp_output_dict["prob_cat"].sum(1, keepdim=True)
-            if neighbor_output_dict is not None:
-                for k in range(self.rec_neigh_num):
-                    neighbor_output_dict["prob_cat"][k] = neighbor_output_dict["prob_cat"][k] + self.prob_cat_to_add
-                    neighbor_output_dict["prob_cat"][k] = neighbor_output_dict["prob_cat"][k] / neighbor_output_dict["prob_cat"][k].sum(1, keepdim=True)
             if self.prior_generator.startswith("tensor"):
                 for force_domain in self.force_add_prob_cat_domain:
                     self.EXPGMGAT.decoder.mu_prior[force_domain].data = nn.Parameter((torch.rand((self.EXPGMGAT.decoder.z_dim), device=self.device, requires_grad=self.EXPGMGAT.decoder.mu_prior.requires_grad) - 0.5) * 2 * np.sqrt(6 / (self.EXPGMGAT.decoder.y_dim + self.EXPGMGAT.decoder.z_dim)))
@@ -765,7 +624,7 @@ class GMVGAT(pl.LightningModule):
                         self.EXPGMGAT.decoder.logvar_prior[force_domain].data = nn.Parameter((torch.rand((self.EXPGMGAT.decoder.z_dim), device=self.device, requires_grad=self.EXPGMGAT.decoder.logvar_prior.requires_grad) - 0.5) * 2 * np.sqrt(6 / (self.EXPGMGAT.decoder.y_dim + self.EXPGMGAT.decoder.z_dim)))
                     elif self.EXPGMGAT.decoder.GMM_model_name == "EEE":
                         self.EXPGMGAT.decoder.logvar_prior = None
-        return exp_output_dict, neighbor_output_dict
+        return exp_output_dict
 
     # def on_train_start(self):
     #     pass
@@ -801,6 +660,7 @@ class GMVGAT(pl.LightningModule):
         # print(torch.cuda.memory_summary())
         if self.automatic_optimization is False:
             exp_opt = self.optimizers()
+            sch = self.lr_schedulers()
         # exp_attr: x
         # exp_rec_attr: rec_x
         # rec_neigh_attr: x's loss neighbors
@@ -811,62 +671,33 @@ class GMVGAT(pl.LightningModule):
         rec_forward_neigh_attr = None
         exp_rec_neigh_affi = 1.
         exp_rec_mask = 1.
-        if self.max_dynamic_neigh:
-            input_nodes, output_nodes, blocks = batch
-            input_block = blocks[0]
-            output_block = blocks[-1]
-            if self.forward_neigh_num:
-                rec_neigh_attr = output_block.srcdata["exp_feature"]
-                if "exp_rec_feature" in output_block.dstdata:
-                    exp_rec_attr = output_block.dstdata["exp_rec_feature"]
-                else:
-                    exp_rec_attr = output_block.dstdata["exp_feature"]
-                input_nodes = input_block.dstdata[NID]
+        input_nodes, output_nodes, blocks = batch
+        input_block = blocks[0]
+        output_block = blocks[-1]
+        if self.forward_neigh_num:
+            rec_neigh_attr = output_block.srcdata["exp_feature"]
+            if "exp_rec_feature" in output_block.dstdata:
+                exp_rec_attr = output_block.dstdata["exp_rec_feature"]
             else:
-                rec_neigh_attr = input_block.srcdata["exp_feature"]
-                if "exp_rec_feature" in output_block.dstdata:
-                    exp_rec_attr = input_block.dstdata["exp_rec_feature"]
-                else:
-                    exp_rec_attr = input_block.dstdata["exp_feature"]
-                exp_attr = input_block.dstdata["exp_feature"]
-            data_index = output_nodes.to("cpu")
-            # the index of output nodes in input_nodes: input_nodes[output_nodes_idx] == output_nodes
-            output_nodes_idx = torch.nonzero(input_nodes == output_nodes.unsqueeze(1))[:, 1]
-            if self.rec_mask_neigh_threshold:
-                exp_rec_mask = input_block.dstdata["exp_rec_mask"]
-            # self.trainig_step_debug_outputs["block"] = input_block
-            # self.trainig_step_debug_outputs["input_nodes"] = input_nodes
-            # self.trainig_step_debug_outputs["output_nodes"] = output_nodes
-
+                exp_rec_attr = output_block.dstdata["exp_feature"]
+            input_nodes = input_block.dstdata[NID]
         else:
-            data_index = batch['index'].to("cpu")
-            exp_attr, exp_rec_attr = batch['exp_feature'], batch['exp_rec_feature']
-            if self.rec_mask_neigh_threshold:
-                exp_rec_mask = batch['exp_rec_mask']
-            if self.supervise_cat:
-                cat = batch["cat"].long()
+            rec_neigh_attr = input_block.srcdata["exp_feature"]
+            if "exp_rec_feature" in output_block.dstdata:
+                exp_rec_attr = input_block.dstdata["exp_rec_feature"]
             else:
-                cat = None
-            rec_cat = None
-            if self.rec_neigh_num or self.forward_neigh_num:
-                if self.rec_neigh_num:
-                    if self.supervise_cat:
-                        rec_cat = batch["rec_cat"].long()
-                    rec_neigh_attr = batch['exp_rec_neigh_feature']
-                    if self.weighted_neigh:
-                        exp_rec_neigh_affi = batch["exp_rec_neigh_affi"]
-                    else:
-                        exp_rec_neigh_affi = None
-                # print("exp_attr.shape", exp_attr.shape)
-                # print("forward_neigh_attr.shape", forward_neigh_attr.shape)
-                if self.forward_neigh_num:
-                    forward_neigh_attr = batch['exp_forward_neigh_feature']
-                if self.rec_neigh_num and self.forward_neigh_num:
-                    rec_forward_neigh_attr = batch['exp_rec_forward_neigh_feature']
-                    # exp_rec_forward_neigh_affi = batch["exp_rec_forward_neigh_affi"]
-                    # exp_neigh_index = batch["exp_neigh_index"].long()
-                    # exp_rec_forward_neigh_index = batch["exp_rec_forward_neigh_index"].long()
-        if self.max_dynamic_neigh and self.forward_neigh_num:
+                exp_rec_attr = input_block.dstdata["exp_feature"]
+            exp_attr = input_block.dstdata["exp_feature"]
+        data_index = output_nodes.to("cpu")
+        # the index of output nodes in input_nodes: input_nodes[output_nodes_idx] == output_nodes
+        output_nodes_idx = torch.nonzero(input_nodes == output_nodes.unsqueeze(1))[:, 1]
+        if self.rec_mask_neigh_threshold:
+            exp_rec_mask = input_block.dstdata["exp_rec_mask"]
+        # self.trainig_step_debug_outputs["block"] = input_block
+        # self.trainig_step_debug_outputs["input_nodes"] = input_nodes
+        # self.trainig_step_debug_outputs["output_nodes"] = output_nodes
+
+        if self.forward_neigh_num:
             self.curr_batch_size = len(output_nodes)
         else:
             self.curr_batch_size = len(exp_attr)
@@ -880,63 +711,52 @@ class GMVGAT(pl.LightningModule):
         ##########################
         # Optimize EXPGMGAT #
         ##########################
-        if self.max_dynamic_neigh:
-            if not self.forward_neigh_num:
-                exp_output_dict, neighbor_output_dict = self.get_forward_outputs(rec_neigh_attr, None, None, None)
-                # # # (C x D), (C, B, D) -> (C, 1, B) -> (C, B) -> (B, C)
-                # exp_output_dict["prob_cat"] = torch.cdist(exp_output_dict["y_means"].unsqueeze(1), exp_output_dict["means"]).squeeze(1).transpose(0, 1)
-                # # # apply RBF kernel
-                # exp_output_dict["prob_cat"] = F.softmax(torch.exp(-torch.square(exp_output_dict["prob_cat"]) / 2), 1)
-            else:
-                # TODO: can be simplified
-                exp_output_dict, neighbor_output_dict = self.get_forward_outputs(input_block, None, None, None)
-            if self.force_enough_classes:
-                exp_output_dict, neighbor_output_dict = self.add_prob_cat(exp_output_dict, neighbor_output_dict)
-            exp_loss_dict, neighbor_loss_dict = self.dynamic_loss(exp_rec_attr, exp_output_dict, output_nodes_idx, input_nodes, output_nodes, rec_neigh_attr, exp_rec_mask)
+        if not self.forward_neigh_num:
+            exp_output_dict = self.get_forward_outputs(rec_neigh_attr)
+            # # # (C x D), (C, B, D) -> (C, 1, B) -> (C, B) -> (B, C)
+            # exp_output_dict["prob_cat"] = torch.cdist(exp_output_dict["y_means"].unsqueeze(1), exp_output_dict["means"]).squeeze(1).transpose(0, 1)
+            # # # apply RBF kernel
+            # exp_output_dict["prob_cat"] = F.softmax(torch.exp(-torch.square(exp_output_dict["prob_cat"]) / 2), 1)
         else:
-            exp_output_dict, neighbor_output_dict = self.get_forward_outputs(exp_attr, forward_neigh_attr, rec_neigh_attr, rec_forward_neigh_attr)
+            # TODO: can be simplified
+            exp_output_dict = self.get_forward_outputs(input_block)
 
-            exp_loss_dict, neighbor_loss_dict = self.gmvae_loss(exp_rec_attr, exp_output_dict, exp_rec_mask, neighbor_output_dict, exp_rec_neigh_affi, cat=cat, rec_cat=rec_cat)
+        exp_loss_dict, neighbor_loss_dict = self.dynamic_loss(exp_rec_attr, exp_output_dict, output_nodes_idx, input_nodes, output_nodes, rec_neigh_attr, exp_rec_mask)
 
         if self.debug:
             self.trainig_step_debug_outputs["exp_output_dict"].append(copy_dict_to_cpu(exp_output_dict))
-            self.trainig_step_debug_outputs["neighbor_output_dict"].append(copy_dict_to_cpu(neighbor_output_dict))
             debug_finite_dict(exp_output_dict, "after forward")
-            debug_finite_dict(neighbor_output_dict, "after forward")
             self.trainig_step_debug_outputs["exp_loss_dict"].append(copy_dict_to_cpu(exp_loss_dict))
             self.trainig_step_debug_outputs["neighbor_loss_dict"].append(copy_dict_to_cpu(neighbor_loss_dict))
             debug_finite_dict(exp_loss_dict, "loss")
             debug_finite_dict(neighbor_loss_dict, "loss")
 
-        if self.max_dynamic_neigh:
-            # already weigh neighbor loss when computing loss
-            exp_reconstruction_loss = self.exp_self_w * exp_loss_dict["reconstruction"] + neighbor_loss_dict["reconstruction"]
-            exp_gaussian_loss = self.exp_self_w * exp_loss_dict["gaussian"] + neighbor_loss_dict["gaussian"]
-            exp_categorical_loss = self.exp_self_w * exp_loss_dict["categorical"] + neighbor_loss_dict["categorical"]
-        else:
-            exp_reconstruction_loss = self.exp_self_w * exp_loss_dict["reconstruction"] + self.exp_neigh_w * neighbor_loss_dict["reconstruction"]
-            exp_gaussian_loss = self.exp_self_w * exp_loss_dict["gaussian"] + self.exp_neigh_w * neighbor_loss_dict["gaussian"]
-            exp_categorical_loss = self.exp_self_w * exp_loss_dict["categorical"] + self.exp_neigh_w * neighbor_loss_dict["categorical"]
+        # already weigh neighbor loss when computing loss
+        exp_reconstruction_loss = self.exp_self_w * exp_loss_dict["reconstruction"] + neighbor_loss_dict["reconstruction"]
+        exp_gaussian_loss = self.exp_self_w * exp_loss_dict["gaussian"] + neighbor_loss_dict["gaussian"]
+        exp_categorical_loss = self.exp_self_w * exp_loss_dict["categorical"] + neighbor_loss_dict["categorical"]
+
         # self.time_dict["loss"] = time.time()
         # print("Time for loss", self.time_dict["loss"] - self.time_dict["forward"])
-        if self.gaussian_start_epoch_pct == 0.:
-            exp_loss = exp_reconstruction_loss + exp_gaussian_loss + exp_categorical_loss
-        else:
-            if self.current_epoch < self.gaussian_start_epoch_pct * self.trainer.max_epochs:
-                exp_loss = exp_reconstruction_loss + exp_categorical_loss
-            elif (self.stop_cluster_init is False) and (self.current_epoch < (self.gaussian_start_epoch_pct * self.trainer.max_epochs + self.sup_epochs)):
-                if self.prior_generator.endswith("mclust") or self.prior_generator.endswith("mclust_rec"):
-                    cluster_init_loss = self.cluster_init_loss(exp_output_dict, cluster_labels=self.valid_cluster_init_labels[input_nodes][output_nodes_idx], output_nodes_idx=output_nodes_idx, degree=self.semi_ce_degree)
-                    self.training_step_outputs["epoch_cluster_init_loss"].append(cluster_init_loss.detach().cpu())
-                    exp_loss = self.exp_sup_w_rec * exp_reconstruction_loss + self.exp_sup_w_gauss * exp_gaussian_loss + \
-                        self.exp_sup_w_cat * exp_categorical_loss + cluster_init_loss
-                    # exp_loss = exp_reconstruction_loss + exp_gaussian_loss + cluster_init_loss
-                    # exp_loss = exp_reconstruction_loss + cluster_init_loss
-                elif (self.prior_generator == "tensor") or (self.prior_generator == "fc"):
-                    # exp_loss = exp_reconstruction_loss + 0.1 * exp_gaussian_loss + exp_categorical_loss
-                    exp_loss = exp_reconstruction_loss + exp_gaussian_loss + exp_categorical_loss
-            else:
+        if not self.separate_backward:
+            if self.gaussian_start_epoch_pct == 0.:
                 exp_loss = exp_reconstruction_loss + exp_gaussian_loss + exp_categorical_loss
+            else:
+                if self.current_epoch < self.gaussian_start_epoch_pct * self.trainer.max_epochs:
+                    exp_loss = exp_reconstruction_loss + exp_categorical_loss
+                elif (self.stop_cluster_init is False) and (self.current_epoch < (self.gaussian_start_epoch_pct * self.trainer.max_epochs + self.sup_epochs)):
+                    if self.prior_generator.endswith("mclust") or self.prior_generator.endswith("mclust_rec"):
+                        cluster_init_loss = self.cluster_init_loss(exp_output_dict, cluster_labels=self.valid_cluster_init_labels[input_nodes][output_nodes_idx], output_nodes_idx=output_nodes_idx, degree=self.semi_ce_degree)
+                        self.training_step_outputs["epoch_cluster_init_loss"].append(cluster_init_loss.detach().cpu())
+                        exp_loss = self.exp_sup_w_rec * exp_reconstruction_loss + self.exp_sup_w_gauss * exp_gaussian_loss + \
+                            self.exp_sup_w_cat * exp_categorical_loss + cluster_init_loss
+                        # exp_loss = exp_reconstruction_loss + exp_gaussian_loss + cluster_init_loss
+                        # exp_loss = exp_reconstruction_loss + cluster_init_loss
+                    elif (self.prior_generator == "tensor") or (self.prior_generator == "fc"):
+                        # exp_loss = exp_reconstruction_loss + 0.1 * exp_gaussian_loss + exp_categorical_loss
+                        exp_loss = exp_reconstruction_loss + exp_gaussian_loss + exp_categorical_loss
+                else:
+                    exp_loss = exp_reconstruction_loss + exp_gaussian_loss + exp_categorical_loss
         # print("curr_epoch", self.current_epoch,
         #     "mu_prior.sum", exp_output_dict["y_means"].sum().cpu(),
         #     #   "exp_loss", exp_loss.detach().cpu().item(),
@@ -954,32 +774,21 @@ class GMVGAT(pl.LightningModule):
             self.trainig_step_debug_outputs["exp_gaussian_loss"].append(exp_gaussian_loss.detach().cpu())
             self.trainig_step_debug_outputs["exp_categorical_loss"].append(exp_categorical_loss.detach().cpu())
             self.trainig_step_debug_outputs["exp_loss"].append(exp_loss.detach().cpu())
-        if self.automatic_optimization is False:
-            raise NotImplementedError
+        if self.separate_backward:
+            exp_loss = exp_reconstruction_loss + exp_gaussian_loss + exp_categorical_loss
             exp_opt.zero_grad()
             # with detect_anomaly():
-            # self.manual_backward(exp_loss)
-            self.manual_backward(exp_reconstruction_loss, retain_graph=True)
-            self.manual_backward(exp_gaussian_loss, retain_graph=True)
-            self.manual_backward(exp_categorical_loss)
+            self.manual_backward(exp_loss)
+            # self.manual_backward(exp_reconstruction_loss, retain_graph=True)
+            # self.manual_backward(exp_gaussian_loss, retain_graph=True)
+            # self.manual_backward(exp_categorical_loss)
             if self.debug:
                 debug_finite_grad(self.EXPGMGAT, "backward")
             exp_opt.step()
             # self.time_dict["backward"] = time.time()
             # print("Time for backward", self.time_dict["backward"] - self.time_dict["loss"])
-            if self.use_pseudo_labels and self.is_well_initialized:
-                exp_output_dict, neighbor_output_dict = self.get_forward_outputs(exp_attr, forward_neigh_attr, rec_neigh_attr, rec_forward_neigh_attr)
-                exp_opt.zero_grad()
-                semi_sup_loss = self.semi_sup_loss(exp_output_dict, neighbor_output_dict)
-                self.manual_backward(semi_sup_loss)
-                exp_opt.step()
-                self.log("train/semi_sup_loss", semi_sup_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=self.curr_batch_size, sync_dist=self.sync_dist)
-        if self.max_dynamic_neigh:
-            exp_prob_cat = exp_output_dict["prob_cat"][output_nodes_idx].detach().half().cpu()
-            exp_means = exp_output_dict["means"][:, output_nodes_idx].detach().half().cpu()
-        else:
-            exp_prob_cat = exp_output_dict["prob_cat"].detach().half().cpu()
-            exp_means = exp_output_dict["means"].detach().half().cpu()
+        exp_prob_cat = exp_output_dict["prob_cat"][output_nodes_idx].detach().half().cpu()
+        exp_means = exp_output_dict["means"][:, output_nodes_idx].detach().half().cpu()
         exp_pred_labels = exp_prob_cat.argmax(-1).flatten()
         self.training_step_outputs["data_index"].append(data_index)
         self.training_step_outputs["epoch_exp_pred_labels"].append(exp_pred_labels)
@@ -1074,22 +883,30 @@ class GMVGAT(pl.LightningModule):
         if self.trainer.world_size == 1:
             data_index = self.training_step_outputs["data_index"]
             data_label = self.training_step_outputs["epoch_exp_pred_labels"]
+            data_prob_cat = self.training_step_outputs["epoch_exp_prob_cat"]
         else:
             data_index = [torch.empty_like(self.training_step_outputs["data_index"]) for _ in range(self.trainer.world_size)]
             data_label = [torch.empty_like(self.training_step_outputs["epoch_exp_pred_labels"]) for _ in range(self.trainer.world_size)]
+            data_prob_cat = [torch.empty_like(self.training_step_outputs["epoch_exp_prob_cat"]) for _ in range(self.trainer.world_size)]
             with torch.no_grad():
                 # gather(self.training_step_outputs["data_index"], data_index)
                 # gather(self.training_step_outputs["epoch_exp_pred_labels"], data_label)
                 all_gather(data_index, self.training_step_outputs["data_index"])
                 all_gather(data_label, self.training_step_outputs["epoch_exp_pred_labels"])
+                all_gather(data_prob_cat, self.training_step_outputs["epoch_exp_prob_cat"])
             # !!! data_index may be repeated
             data_index = torch.cat(data_index, dim=0)
             data_label = torch.cat(data_label, dim=0)
+            data_prob_cat = torch.cat(data_prob_cat, dim=0)
         data_index = data_index.numpy()
         data_label = data_label.numpy()
+        data_prob_cat = data_prob_cat.numpy()
         # self.trainer.datamodule.data_val.adata.obs.iloc[data_index, adata_ref.obs.columns.get_loc("pred_labels")] = self.training_step_outputs["epoch_exp_pred_labels"]
         # epoch_exp_pred_df = pd.DataFrame({"exp_pred_labels": self.training_step_outputs["epoch_exp_pred_labels"]}, index=data_index)
+        # data_index can be repeated, because the last one will be replaced in the end and represent the latest prediction
         self.trainer.datamodule.data_val.adata.obs.iloc[data_index, self.trainer.datamodule.data_val.adata.obs.columns.get_loc("pred_labels")] = data_label
+        self.trainer.datamodule.data_val.adata.obsm["prob_cat"][data_index] = data_prob_cat
+
         adata_ref = self.trainer.datamodule.data_val.adata
         epoch_exp_pred_df = pd.DataFrame({"exp_pred_labels": data_label}, index=data_index)
         if self.last_epoch_exp_pred_df is not None:
@@ -1103,46 +920,45 @@ class GMVGAT(pl.LightningModule):
             self.log("train/pred_diff_pct", pred_diff_pct, on_step=False, on_epoch=True, prog_bar=False, sync_dist=self.sync_dist)
             if self.current_epoch >= self.patience_start_epoch_pct * self.trainer.max_epochs - 1: # [0, 49], 50~, data preparation starts at the end of the 49th epoch
                 self.trainer.datamodule.recreate_dgl_dataset = True
-                if self.max_dynamic_neigh:
-                    if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
-                        for j in range(len(self.trainer.datamodule.data_val.dynamic_neigh_nums)):
-                            this_cluster_node_idx = adata_ref[data_index].obs["pred_labels"] == j
-                            if this_cluster_node_idx.sum() == 0:
-                                continue
-                            # neigh idx in original adata: this_cluster_node_num x max_dynamic_neigh_num
-                            this_cluster_neigh_idx = adata_ref[data_index].obsm['sp_k'][this_cluster_node_idx, :]
-                            this_cluster_neigh_label = adata_ref.obs["pred_labels"].to_numpy()[this_cluster_neigh_idx]
-                            self.trainer.datamodule.data_val.dynamic_neigh_nums[j] = min(self.max_dynamic_neigh, max(1, int(np.quantile((this_cluster_neigh_label == j).sum(1), self.dynamic_neigh_quantile))))
-                        # print(self.trainer.datamodule.data_val.dynamic_neigh_nums)
-                    elif self.dynamic_neigh_level == Dynamic_neigh_level.unit:
-                        # self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index] = adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]] == adata_ref[data_index].obs["pred_labels"].to_numpy()[:, np.newaxis]
-                        all_cat_count = self.batched_bincount(torch.from_numpy(adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]]), dim=1, max_value=self.num_classes).numpy()
-                        each_obs_neighbor_cat = all_cat_count.argmax(1)
-                        self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index] = adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]] == each_obs_neighbor_cat[:, np.newaxis]
-                        # self.trainer.datamodule.data_val.dynamic_neigh_nums = np.minimum(self.max_dynamic_neigh, np.maximum(1, self.trainer.datamodule.data_val.adata.obsm["consist_adj"].sum(1)))
-                        self.trainer.datamodule.data_val.dynamic_neigh_nums = np.minimum(self.max_dynamic_neigh, self.trainer.datamodule.data_val.adata.obsm["consist_adj"].sum(1))
-                    elif self.dynamic_neigh_level == Dynamic_neigh_level.unit_freq_self:
-                        all_cat_count = self.batched_bincount(torch.from_numpy(adata_ref.obs["pred_labels"].to_numpy()[np.concatenate((data_index[:, np.newaxis], adata_ref[data_index].obsm["sp_k"]), 1)]), dim=1, max_value=self.num_classes).numpy()
-                        # each_obs_neighbor_cat_values, each_obs_neighbor_cats = torch.topk(all_cat_count, k=2, dim=1)
-                        # is_first_two_large_neighbor_domains_equal = (each_obs_neighbor_cat_values[:, 0] == each_obs_neighbor_cat_values[:, 1]).numpy()
-                        # # for each obs, if the first two largest neighbor domains are not equal, then the obs has neighbors of the largest domain
-                        # each_obs_neighbor_cat = each_obs_neighbor_cats[:, 0].numpy()
-                        # self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index][~is_first_two_large_neighbor_domains_equal] = \
-                        #     adata_ref.obs["pred_labels"].to_numpy()[np.concatenate((data_index, adata_ref[data_index].obsm["sp_k"]), 1)][~is_first_two_large_neighbor_domains_equal] == each_obs_neighbor_cat[~is_first_two_large_neighbor_domains_equal][:, np.newaxis]
-                        # self.trainer.datamodule.data_val.dynamic_neigh_nums[data_index][~is_first_two_large_neighbor_domains_equal] = \
-                        #     np.minimum(self.max_dynamic_neigh, self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index][~is_first_two_large_neighbor_domains_equal].sum(1))
+                if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
+                    for j in range(len(self.trainer.datamodule.data_val.dynamic_neigh_nums)):
+                        this_cluster_node_idx = adata_ref[data_index].obs["pred_labels"] == j
+                        if this_cluster_node_idx.sum() == 0:
+                            continue
+                        # neigh idx in original adata: this_cluster_node_num x max_dynamic_neigh_num
+                        this_cluster_neigh_idx = adata_ref[data_index].obsm['sp_k'][this_cluster_node_idx, :]
+                        this_cluster_neigh_label = adata_ref.obs["pred_labels"].to_numpy()[this_cluster_neigh_idx]
+                        self.trainer.datamodule.data_val.dynamic_neigh_nums[j] = min(self.max_dynamic_neigh, max(1, int(np.quantile((this_cluster_neigh_label == j).sum(1), self.dynamic_neigh_quantile))))
+                    # print(self.trainer.datamodule.data_val.dynamic_neigh_nums)
+                elif self.dynamic_neigh_level == Dynamic_neigh_level.unit:
+                    # self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index] = adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]] == adata_ref[data_index].obs["pred_labels"].to_numpy()[:, np.newaxis]
+                    all_cat_count = self.batched_bincount(torch.from_numpy(adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]]), dim=1, max_value=self.num_classes).numpy()
+                    each_obs_neighbor_cat = all_cat_count.argmax(1)
+                    self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index] = adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]] == each_obs_neighbor_cat[:, np.newaxis]
+                    # self.trainer.datamodule.data_val.dynamic_neigh_nums = np.minimum(self.max_dynamic_neigh, np.maximum(1, self.trainer.datamodule.data_val.adata.obsm["consist_adj"].sum(1)))
+                    self.trainer.datamodule.data_val.dynamic_neigh_nums = np.minimum(self.max_dynamic_neigh, self.trainer.datamodule.data_val.adata.obsm["consist_adj"].sum(1))
+                elif self.dynamic_neigh_level == Dynamic_neigh_level.unit_freq_self:
+                    all_cat_count = self.batched_bincount(torch.from_numpy(adata_ref.obs["pred_labels"].to_numpy()[np.concatenate((data_index[:, np.newaxis], adata_ref[data_index].obsm["sp_k"]), 1)]), dim=1, max_value=self.num_classes).numpy()
+                    # each_obs_neighbor_cat_values, each_obs_neighbor_cats = torch.topk(all_cat_count, k=2, dim=1)
+                    # is_first_two_large_neighbor_domains_equal = (each_obs_neighbor_cat_values[:, 0] == each_obs_neighbor_cat_values[:, 1]).numpy()
+                    # # for each obs, if the first two largest neighbor domains are not equal, then the obs has neighbors of the largest domain
+                    # each_obs_neighbor_cat = each_obs_neighbor_cats[:, 0].numpy()
+                    # self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index][~is_first_two_large_neighbor_domains_equal] = \
+                    #     adata_ref.obs["pred_labels"].to_numpy()[np.concatenate((data_index, adata_ref[data_index].obsm["sp_k"]), 1)][~is_first_two_large_neighbor_domains_equal] == each_obs_neighbor_cat[~is_first_two_large_neighbor_domains_equal][:, np.newaxis]
+                    # self.trainer.datamodule.data_val.dynamic_neigh_nums[data_index][~is_first_two_large_neighbor_domains_equal] = \
+                    #     np.minimum(self.max_dynamic_neigh, self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index][~is_first_two_large_neighbor_domains_equal].sum(1))
 
-                        # for each obs, if the first two largest neighbor domains are not equal, then the obs has neighbors of one of the largest domain
-                        each_obs_neighbor_cat = all_cat_count.argmax(1)
-                        self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index] = adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]] == each_obs_neighbor_cat[:, np.newaxis]
-                        self.trainer.datamodule.data_val.dynamic_neigh_nums = np.minimum(self.max_dynamic_neigh, self.trainer.datamodule.data_val.adata.obsm["consist_adj"].sum(1))
-                    elif self.dynamic_neigh_level == Dynamic_neigh_level.unit_fix_domain or self.dynamic_neigh_level == Dynamic_neigh_level.unit_fix_domain_boundary:
-                        self.trainer.datamodule.start_use_domain_neigh = True
-                    elif self.dynamic_neigh_level == Dynamic_neigh_level.unit_domain_boundary:
-                        self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index] = adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]] == adata_ref.obs["pred_labels"].to_numpy()[:, np.newaxis]
-                        self.trainer.datamodule.data_val.dynamic_neigh_nums = np.minimum(self.max_dynamic_neigh, self.trainer.datamodule.data_val.adata.obsm["consist_adj"].sum(1))
-                    if self.exp_neigh_w == "auto":
-                        self.exp_neigh_ws = torch.tensor(self.trainer.datamodule.data_val.dynamic_neigh_nums, dtype=torch.float32, device=self.data_device)
+                    # for each obs, if the first two largest neighbor domains are not equal, then the obs has neighbors of one of the largest domain
+                    each_obs_neighbor_cat = all_cat_count.argmax(1)
+                    self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index] = adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]] == each_obs_neighbor_cat[:, np.newaxis]
+                    self.trainer.datamodule.data_val.dynamic_neigh_nums = np.minimum(self.max_dynamic_neigh, self.trainer.datamodule.data_val.adata.obsm["consist_adj"].sum(1))
+                elif self.dynamic_neigh_level.name.startswith("unit_fix_domain"):
+                    self.trainer.datamodule.start_use_domain_neigh = True
+                elif self.dynamic_neigh_level == Dynamic_neigh_level.unit_domain_boundary:
+                    self.trainer.datamodule.data_val.adata.obsm["consist_adj"][data_index] = adata_ref.obs["pred_labels"].to_numpy()[adata_ref[data_index].obsm["sp_k"]] == adata_ref.obs["pred_labels"].to_numpy()[:, np.newaxis]
+                    self.trainer.datamodule.data_val.dynamic_neigh_nums = np.minimum(self.max_dynamic_neigh, self.trainer.datamodule.data_val.adata.obsm["consist_adj"].sum(1))
+                if self.exp_neigh_w == "auto":
+                    self.exp_neigh_ws = torch.tensor(self.trainer.datamodule.data_val.dynamic_neigh_nums, dtype=torch.float32, device=self.data_device)
                 if pred_diff_pct < self.patience_diff_pct:
                     self.pred_diff_patience += 1.
                 else:
@@ -1156,8 +972,8 @@ class GMVGAT(pl.LightningModule):
 
         # print(self.current_epoch, "lr", self.trainer.lr_scheduler_configs[0].scheduler.get_last_lr()[0])
         if self.prior_lr > 0:
-            mean_prob_cat = self.training_step_outputs["epoch_exp_prob_cat"].mean(0).numpy()
-            if self.allow_fewer_classes or mean_prob_cat.min() * len(self.training_step_outputs["epoch_exp_prob_cat"]) >= 100:
+            mean_prob_cat = data_prob_cat.mean(0)
+            if self.allow_fewer_classes or mean_prob_cat.min() * len(data_prob_cat) >= self.min_cluster_size:
                 # updated_prior = self.updated_prior + self.prior_lr * (mean_prob_cat - self.updated_prior)
                 # updated_prior = updated_prior / updated_prior.sum()
                 # if updated_prior.max() > self.updated_prior.max():
@@ -1235,52 +1051,29 @@ class GMVGAT(pl.LightningModule):
         # print(torch.cuda.memory_summary())
         # print("max_memory_allocated", torch.cuda.max_memory_allocated() / 10**9, "GB")
         # print("max_memory_reserved", torch.cuda.max_memory_reserved() / 10**9, "GB")
-        if self.max_dynamic_neigh:
-            # input_nodes, output_nodes, blocks = batch
-            _, output_nodes, blocks = batch
-            input_block = blocks[0]
-            if self.forward_neigh_num:
-                # input_nodes = input_block.dstdata[NID]
-                # input_nodes = input_block.srcdata[NID]
-                # self.validation_step_debug_outputs["input_nodes"] = input_nodes
-                # self.validation_step_debug_outputs["output_nodes"] = output_nodes
-                # self.validation_step_debug_outputs["block"] = blocks
-                # return
-                pass
-            else:
-                exp_attr = input_block.dstdata["exp_feature"]
-            data_index = output_nodes.cpu()
+        # input_nodes, output_nodes, blocks = batch
+        _, output_nodes, blocks = batch
+        input_block = blocks[0]
+        if self.forward_neigh_num:
+            # input_nodes = input_block.dstdata[NID]
+            # input_nodes = input_block.srcdata[NID]
+            # self.validation_step_debug_outputs["input_nodes"] = input_nodes
+            # self.validation_step_debug_outputs["output_nodes"] = output_nodes
+            # self.validation_step_debug_outputs["block"] = blocks
+            # return
+            pass
         else:
-            forward_neigh_attr = None
-            rec_neigh_attr = None
-            rec_forward_neigh_attr = None
-            data_index = batch["index"].to("cpu")
-            exp_attr = batch['exp_feature']
-            # exp_vis_bi_adj, sp_vis_bi_adj, labels = batch['exp_vis_bi_adj'], batch['sp_vis_bi_adj'], batch['labels']
-            # sp_vis_bi_adj, labels = batch['sp_vis_bi_adj'], batch['labels']
-            if self.forward_neigh_num:
-                forward_neigh_attr = batch['exp_forward_neigh_feature']
-            if self.rec_neigh_num:
-                rec_neigh_attr = batch['exp_rec_neigh_feature']
-                # exp_neigh_index = batch['exp_neigh_index'].long()
-            if self.forward_neigh_num and self.rec_neigh_num:
-                rec_forward_neigh_attr = batch['exp_rec_forward_neigh_feature']
-                # exp_rec_forward_neigh_index = batch['exp_rec_forward_neigh_index'].long()
+            exp_attr = input_block.dstdata["exp_feature"]
+        data_index = output_nodes.cpu()
 
         if not self.forward_neigh_num:
             exp_output_dict = self.EXPGMGAT(
                 x=exp_attr,
             )
         else:
-            if self.max_dynamic_neigh:
-                exp_output_dict = self.EXPGMGAT(
-                    x=input_block,
-                )
-            else:
-                exp_output_dict = self.EXPGMGAT(
-                    x=exp_attr,
-                    neighbor_x=forward_neigh_attr,
-                )
+            exp_output_dict = self.EXPGMGAT(
+                x=input_block,
+            )
 
         # # # (C x D), (C, B, D) -> (C, 1, B) -> (C, B) -> (B, C)
         # exp_output_dict["prob_cat"] = torch.cdist(exp_output_dict["y_means"].unsqueeze(1), exp_output_dict["means"]).squeeze(1).transpose(0, 1)
@@ -1300,67 +1093,7 @@ class GMVGAT(pl.LightningModule):
             exp_mix_rec = (exp_output_dict["reconstructed"]["z_1"].detach() * exp_output_dict["prob_cat"].detach().T.unsqueeze(-1)).half().cpu()
         # elif self.exp_rec_type == "MSE":
         #     exp_rec = exp_output_dict["reconstructed"]["z"].detach().cpu()
-        if self.max_dynamic_neigh:
-            pass
-            # self.validation_step_outputs["input_nodes"] = input_nodes.detach().cpu()
-            # self.validation_step_outputs["output_nodes"] = output_nodes.detach().cpu()
-        else:
-            if self.rec_neigh_num:
-                # B x K1 x G
-                B, K, G = rec_neigh_attr.shape
-                neighbor_output_dict = collections.defaultdict(list)
-                for k in range(self.rec_neigh_num):
-                    if not self.forward_neigh_num:
-                        neighbor_temp_dict = self.EXPGMGAT(
-                            x=rec_neigh_attr[:, k, :],
-                        )
-                    else:
-                        neighbor_temp_dict = self.EXPGMGAT(
-                            x=rec_neigh_attr[:, k, :],
-                            neighbor_x=rec_forward_neigh_attr[:, k, :, :],
-                        )
-                    for key in neighbor_temp_dict:
-                        if isinstance(neighbor_temp_dict[key], torch.Tensor):
-                            neighbor_output_dict[key].append(neighbor_temp_dict[key])
-                        elif isinstance(neighbor_temp_dict[key], dict):
-                            if key not in neighbor_output_dict:
-                                neighbor_output_dict[key] = collections.defaultdict(list)
-                            for subkey in neighbor_temp_dict[key]:
-                                neighbor_output_dict[key][subkey].append(neighbor_temp_dict[key][subkey])
-                for key in neighbor_output_dict:
-                    # print(key, type(neighbor_output_dict[key]))
-                    if isinstance(neighbor_output_dict[key], list):
-                        # print(key, neighbor_output_dict[key][0].shape)
-                        if key in ["means", "logvars", "gaussians"]:
-                            # C x B x D -> C x B x K x D
-                            neighbor_output_dict[key] = torch.stack(neighbor_output_dict[key], dim=2).reshape(self.num_classes, B, self.rec_neigh_num, -1)
-                        # elif key in ["logits", "prob_cat", "categorical"]:
-                        elif key in ["logits", "prob_cat"]:
-                            # B x C -> B x K x C
-                            neighbor_output_dict[key] = torch.stack(neighbor_output_dict[key], dim=1).reshape(B, self.rec_neigh_num, self.num_classes)
-                        elif key in ["y_means", "y_logvars"]:
-                            # C x D
-                            # assert (neighbor_output_dict[key][0] == neighbor_output_dict[key][-1]).all()
-                            if not (neighbor_output_dict[key][0] == neighbor_output_dict[key][-1]).all():
-                                print("Nan found in output")
-                            neighbor_output_dict[key] = neighbor_output_dict[key][0]
-                    elif isinstance(neighbor_output_dict[key], collections.defaultdict):
-                        # a dict of lists of Tensors
-                        for subkey in neighbor_output_dict[key]:
-                            # print(key, subkey, type(neighbor_output_dict[key][subkey][0]))
-                            if subkey in ['z_r', 'z_p']:
-                                # D
-                                # print(key, subkey, neighbor_output_dict[key][subkey][0].shape)
-                                neighbor_output_dict[key][subkey] = neighbor_output_dict[key][subkey][0]
-                            elif subkey in ['z']:
-                                # C x B x D -> C x B x K x D
-                                neighbor_output_dict[key][subkey] = torch.stack(neighbor_output_dict[key][subkey], dim=2).reshape(self.num_classes, B, self.rec_neigh_num, -1)
-                            elif subkey in ['z_r_type']:
-                                # str
-                                neighbor_output_dict[key][subkey] = neighbor_output_dict[key][subkey][0]
-                exp_neigh_prob_cat = neighbor_output_dict["prob_cat"].detach().half().cpu()
-                exp_neigh_pred_labels = exp_neigh_prob_cat.argmax(-1)
-                self.validation_step_outputs["epoch_exp_neigh_pred_labels"].append(exp_neigh_pred_labels)
+
         exp_pred_labels = exp_prob_cat.argmax(-1).flatten()
         self.validation_step_outputs["data_index"].append(data_index)
         self.validation_step_outputs["epoch_exp_pred_labels"].append(exp_pred_labels)
@@ -1384,16 +1117,7 @@ class GMVGAT(pl.LightningModule):
     def on_validation_epoch_end(self):
         # print(f"start valid epoch end {self.current_epoch}")
         # print(torch.cuda.memory_summary())
-        # if self.max_dynamic_neigh and self.forward_neigh_num:
-        #     raise NotImplementedError
-        # else:
         # model_checkpoint.every_n_epochs
-        if self.trainer.is_global_zero:
-            if (self.current_epoch + 1) % 50 == 0:
-                self.trainer.datamodule.data_val.adata.obs["pred_labels"].to_csv(osp.join(self.log_path, f"pred_labels_epoch_{self.current_epoch}.csv.gz"))
-                written_adata = self.trainer.datamodule.data_val.adata.copy()
-                del written_adata.uns
-                written_adata.write_h5ad(osp.join(self.log_path, f"epoch_{self.current_epoch}.h5ad"), compression="gzip")
         for k, v in self.validation_step_outputs.items():
             if (k == "epoch_exp_means") or (k == "epoch_exp_rec") or (k == "epoch_exp_mix_rec"):
                 self.validation_step_outputs[k] = torch.cat(v, dim=1) # huge memory consumption for large datasets
@@ -1422,16 +1146,73 @@ class GMVGAT(pl.LightningModule):
                 epoch_exp_mix_rec = gather_nd_to_rank(self.validation_step_outputs["epoch_exp_mix_rec"], axis=1).numpy()
 
         # print("epoch_exp_pred_labels at no_grad", epoch_exp_pred_labels.shape)
-        if self.max_dynamic_neigh:
-            # sorted_epoch_data_index = np.argsort(epoch_data_index) # assume epoch_data_index is non-repeating
-            sorted_epoch_data_index = np.unique(epoch_data_index, return_index=True)[1] # assume epoch_data_index is full (containing 0th to the last index)
-            epoch_exp_pred_labels = epoch_exp_pred_labels[sorted_epoch_data_index]
-            # print("epoch_exp_pred_labels after sorting", epoch_exp_pred_labels.shape)
-            epoch_exp_prob_cat = epoch_exp_prob_cat[sorted_epoch_data_index]
-            if self.trainer.is_global_zero:
-                epoch_exp_means = epoch_exp_means[:, sorted_epoch_data_index]
-                # epoch_exp_rec = epoch_exp_rec[:, sorted_epoch_data_index] # huge memory consumption for large datasets
-                epoch_exp_mix_rec = epoch_exp_mix_rec[:, sorted_epoch_data_index]
+        # sorted_epoch_data_index = np.argsort(epoch_data_index) # assume epoch_data_index is non-repeating
+        sorted_epoch_data_index = np.unique(epoch_data_index, return_index=True)[1] # assume epoch_data_index is full (containing 0th to the last index)
+        epoch_exp_pred_labels = epoch_exp_pred_labels[sorted_epoch_data_index]
+        # print("epoch_exp_pred_labels after sorting", epoch_exp_pred_labels.shape)
+        epoch_exp_prob_cat = epoch_exp_prob_cat[sorted_epoch_data_index]
+        if self.trainer.is_global_zero:
+            epoch_exp_means = epoch_exp_means[:, sorted_epoch_data_index]
+            # epoch_exp_rec = epoch_exp_rec[:, sorted_epoch_data_index] # huge memory consumption for large datasets
+            epoch_exp_mix_rec = epoch_exp_mix_rec[:, sorted_epoch_data_index]
+            if ((self.current_epoch + 1) % 50 == 0) and (self.trainer.datamodule.resample_to is None):
+                self.trainer.datamodule.data_val.adata.obs["pred_labels"].to_csv(osp.join(self.log_path, f"pred_labels_epoch_{self.current_epoch}.csv.gz"))
+                written_adata = self.trainer.datamodule.data_val.adata.copy()
+                written_adata.X = epoch_exp_mix_rec.sum(0)
+                del written_adata.uns
+                if self.refine_ae_channels:
+                    min_max_scaler = MinMaxScaler()
+                    mlp_non_repeat_input = min_max_scaler.fit_transform(written_adata.obsm["spatial"])
+                    uni_domain, uni_domain_unit_indices, uni_domain_unit_counts = np.unique(written_adata.obs["pred_labels"].values, return_inverse=True, return_counts=True)
+                    uni_domain_unit_sorted_idx = uni_domain_unit_counts.argsort()
+                    smallest_domain_unit_idx = uni_domain_unit_sorted_idx[0]
+                    if len(uni_domain_unit_sorted_idx) > 1:
+                        second_smallest_domain_unit_idx = uni_domain_unit_sorted_idx[1]
+                        # resample smallest_donmain_unit such that its number is the same as second_smallest_domain_unit
+                        smallest_domain_unit_indices = np.where(uni_domain_unit_indices == smallest_domain_unit_idx)[0]
+                        rng = np.random.default_rng(42)
+                        smallest_domain_unit_indices = rng.choice(smallest_domain_unit_indices, size=uni_domain_unit_counts[second_smallest_domain_unit_idx], replace=True)
+                        mlp_input = np.concatenate((mlp_non_repeat_input, mlp_non_repeat_input[smallest_domain_unit_indices]), axis=0)
+                        mlp_label = np.concatenate((written_adata.obs["pred_labels"].values, written_adata.obs["pred_labels"].values[smallest_domain_unit_indices]), axis=0)
+                        clf = MLPClassifier(random_state=42, hidden_layer_sizes=self.refine_ae_channels, early_stopping=False).fit(mlp_input, mlp_label) # defaults
+                        written_adata.obs.loc[:, "mlp_outlier"] = clf.predict_proba(mlp_non_repeat_input).max(1) <= 0.5
+                        written_adata.obs.loc[:, "mlp_fit"] = clf.predict_proba(mlp_non_repeat_input).argmax(1)
+                    else:
+                        written_adata.obs.loc[:, "mlp_outlier"] = False
+                        written_adata.obs.loc[:, "mlp_fit"] = written_adata.obs["pred_labels"].values
+                        print("It makes no sense to apply MLP for labels with only one cluster.")
+                if self.detect_svg:
+                    ig = IntegratedGradients(self.EXPGMGAT.encoder)
+                    x_and_neigh_attrs = []
+                    deltas = []
+                    written_adata.var_names_make_unique('.')
+                    threshold_layer = self.trainer.datamodule.data_val.count_key
+
+                    if isinstance(written_adata.layers[threshold_layer], scipy.sparse.csr.csr_matrix):
+                        written_adata.layers[threshold_layer] = written_adata.layers[threshold_layer].toarray()
+                    x_and_neigh_input_np = np.concatenate((np.expand_dims(written_adata.X, 1), written_adata.X[written_adata.obsm["used_k"]]), axis=1)
+                    for i in range(0, len(written_adata), self.curr_batch_size):
+                        x_and_neigh_batch_input_np = x_and_neigh_input_np[i:i+self.curr_batch_size].copy()
+                        x_and_neigh_attributes = torch.from_numpy(x_and_neigh_batch_input_np).float().requires_grad_().to(self.device)
+                        baseline_np = np.broadcast_to(np.expand_dims(written_adata.X.min(0, keepdims=True), 1),
+                                                                    (x_and_neigh_attributes.shape[0], written_adata.obsm["used_k"].shape[1] + 1, written_adata.shape[1])).copy()
+                        x_and_neigh_baseline = torch.from_numpy(baseline_np).float().requires_grad_().to(self.device)
+                        x_and_neigh_attr, delta = ig.attribute(x_and_neigh_attributes, x_and_neigh_baseline, internal_batch_size=self.curr_batch_size,
+                                                                target=written_adata.obs[i:(i+self.curr_batch_size)]["pred_labels"].to_list(),
+                                                                n_steps=50, additional_forward_args=(None, True), return_convergence_delta=True)
+                        x_and_neigh_attrs.append(x_and_neigh_attr)
+                        deltas.append(delta)
+                    x_and_neigh_attrs = torch.cat(x_and_neigh_attrs, dim=0)
+                    x_attrs = x_and_neigh_attrs[:, 0, :]
+                    written_adata.obs["pred_labels"] = written_adata.obs["pred_labels"].astype("category")
+                    svg_dict = {}
+                    for pred_type in written_adata.obs["pred_labels"].value_counts().sort_index().index:
+                        # print(f"pred_type: {pred_type}")
+                        x_attrs_pred = x_attrs[written_adata.obs["pred_labels"] == pred_type].mean(0)
+                        x_attrs_genes = x_attrs_pred.argsort(descending=True)[:self.detect_svg].cpu().numpy()
+                        svg_dict[str(pred_type)] = written_adata.var_names[x_attrs_genes].tolist()
+                    written_adata.uns["svg_dict"] = svg_dict
+                written_adata.write_h5ad(osp.join(self.log_path, f"epoch_{self.current_epoch}.h5ad"), compression="gzip")
         if self.gaussian_start_epoch_pct > 0.:
             if self.current_epoch == (self.gaussian_start_epoch_pct * self.trainer.max_epochs - 1):
                 if self.trainer.is_global_zero:
@@ -1460,7 +1241,10 @@ class GMVGAT(pl.LightningModule):
                             if self.is_labelled:
                                 gt_center[j] = np.mean(epoch_exp_prob_cat_means[self.trainer.datamodule.data_val.adata.obs[f"{self.trainer.datamodule.data_val.annotation_key}_int"] == j], axis=0) # the same as above
                             # original_pseudo_center[j] = np.mean(epoch_exp_prob_cat_means[epoch_exp_pred_labels == j], axis=0)
-                            original_pseudo_center[j] = np.average(epoch_exp_embed[j], axis=0, weights=epoch_exp_prob_cat[:, j])
+                            if epoch_exp_prob_cat[:, j].sum() == 0.:
+                                original_pseudo_center[j] = np.average(epoch_exp_embed[j], axis=0)
+                            else:
+                                original_pseudo_center[j] = np.average(epoch_exp_embed[j], axis=0, weights=epoch_exp_prob_cat[:, j])
                         # original_pseudo_center_cp = original_pseudo_center.copy()
 
                         rpy2.robjects.packages.quiet_require("mclust")
@@ -1476,7 +1260,11 @@ class GMVGAT(pl.LightningModule):
                             rmclust = robjects.r['Mclust']
                             if self.prior_generator.endswith("rec"):
                                 mclust_pca = PCA(n_components=20, random_state=self.seed)
-                                mclust_pca_embedding = mclust_pca.fit_transform(epoch_exp_prob_cat_rec.astype(np.float32))
+                                try:
+                                    mclust_pca_embedding = mclust_pca.fit_transform(epoch_exp_prob_cat_rec.astype(np.float32))
+                                except:
+                                    mclust_pca_embedding = mclust_pca.fit_transform(np.nan_to_num(epoch_exp_prob_cat_rec.astype(np.float32)))
+                                    print("NaN encountered during PCA.")
                                 rmclust_res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(mclust_pca_embedding), self.num_classes, GMM_model.EEE.name, verbose=False)
                             else:
                                 rmclust_res = rmclust(rpy2.robjects.numpy2ri.numpy2rpy(epoch_exp_prob_cat_means.astype(np.float32)), self.num_classes, GMM_model.EEE.name, verbose=False)
@@ -1544,35 +1332,31 @@ class GMVGAT(pl.LightningModule):
 
         if self.trainer.is_global_zero:
             if self.rec_neigh_num:
-                if self.max_dynamic_neigh:
-                    if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
-                        if len(np.unique(self.trainer.datamodule.data_val.dynamic_neigh_nums)) == 1:
-                            neigh_consistency_sum_score = 0.
-                            # print("epoch_exp_pred_labels.shape", epoch_exp_pred_labels.shape)
-                            # print("self.trainer.datamodule.data_val.adata.obsm['sp_k'].shape", self.trainer.datamodule.data_val.adata.obsm['sp_k'].shape)
-                            # print("self.trainer.datamodule.data_val.dynamic_neigh_nums[0]", self.trainer.datamodule.data_val.dynamic_neigh_nums[0])
-                            # print("epoch_exp_pred_labels[self.trainer.datamodule.data_val.adata.obsm['sp_k'][:, :self.trainer.datamodule.data_val.dynamic_neigh_nums[0]]].shape", epoch_exp_pred_labels[self.trainer.datamodule.data_val.adata.obsm['sp_k'][:, :self.trainer.datamodule.data_val.dynamic_neigh_nums[0]]].shape)
-                            neigh_consistency_score = np.mean(epoch_exp_pred_labels[self.trainer.datamodule.data_val.adata.obsm['sp_k'][:, :self.trainer.datamodule.data_val.dynamic_neigh_nums[0]]] == np.expand_dims(epoch_exp_pred_labels, -1))
-                        else:
-                            neigh_consistency_score = []
-                            neigh_consistency_sum_score = []
-                            neigh_consistency_sum_score_factor = 0.
-                            for j, dynamic_neigh_num in enumerate(self.trainer.datamodule.data_val.dynamic_neigh_nums):
-                                this_cluster_node_idx = self.trainer.datamodule.data_val.adata.obs["pred_labels"] == j
-                                score_neighbors = self.trainer.datamodule.data_val.adata.obsm['sp_k'][this_cluster_node_idx, :dynamic_neigh_num]
-                                score_neighbors_label = epoch_exp_pred_labels[score_neighbors]
-                                is_score_neighbors_consistency = score_neighbors_label == np.expand_dims(epoch_exp_pred_labels[this_cluster_node_idx], -1)
-                                # self.validation_step_debug_outputs["score_neighbors"] = score_neighbors
-                                # self.validation_step_debug_outputs["score_neighbors_label"] = score_neighbors_label
-                                # print(j, dynamic_neigh_num, score_neighbors.shape, is_score_neighbors_consistency.shape)
-                                neigh_consistency_score.append(np.mean(is_score_neighbors_consistency, axis=1))
-                                neigh_consistency_sum_score.append(np.sum(is_score_neighbors_consistency))
-                                neigh_consistency_sum_score_factor += this_cluster_node_idx.sum() * dynamic_neigh_num
-                            neigh_consistency_score = np.mean(np.concatenate(neigh_consistency_score))
-                            neigh_consistency_sum_score = np.sum(neigh_consistency_sum_score) / neigh_consistency_sum_score_factor
-                else:
-                    epoch_exp_neigh_pred_labels = np.concatenate(self.validation_step_outputs["epoch_exp_neigh_pred_labels"])
-                    neigh_consistency_score = np.mean(np.expand_dims(epoch_exp_pred_labels, -1) == epoch_exp_neigh_pred_labels)
+                if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
+                    if len(np.unique(self.trainer.datamodule.data_val.dynamic_neigh_nums)) == 1:
+                        neigh_consistency_sum_score = 0.
+                        # print("epoch_exp_pred_labels.shape", epoch_exp_pred_labels.shape)
+                        # print("self.trainer.datamodule.data_val.adata.obsm['sp_k'].shape", self.trainer.datamodule.data_val.adata.obsm['sp_k'].shape)
+                        # print("self.trainer.datamodule.data_val.dynamic_neigh_nums[0]", self.trainer.datamodule.data_val.dynamic_neigh_nums[0])
+                        # print("epoch_exp_pred_labels[self.trainer.datamodule.data_val.adata.obsm['sp_k'][:, :self.trainer.datamodule.data_val.dynamic_neigh_nums[0]]].shape", epoch_exp_pred_labels[self.trainer.datamodule.data_val.adata.obsm['sp_k'][:, :self.trainer.datamodule.data_val.dynamic_neigh_nums[0]]].shape)
+                        neigh_consistency_score = np.mean(epoch_exp_pred_labels[self.trainer.datamodule.data_val.adata.obsm['sp_k'][:, :self.trainer.datamodule.data_val.dynamic_neigh_nums[0]]] == np.expand_dims(epoch_exp_pred_labels, -1))
+                    else:
+                        neigh_consistency_score = []
+                        neigh_consistency_sum_score = []
+                        neigh_consistency_sum_score_factor = 0.
+                        for j, dynamic_neigh_num in enumerate(self.trainer.datamodule.data_val.dynamic_neigh_nums):
+                            this_cluster_node_idx = self.trainer.datamodule.data_val.adata.obs["pred_labels"] == j
+                            score_neighbors = self.trainer.datamodule.data_val.adata.obsm['sp_k'][this_cluster_node_idx, :dynamic_neigh_num]
+                            score_neighbors_label = epoch_exp_pred_labels[score_neighbors]
+                            is_score_neighbors_consistency = score_neighbors_label == np.expand_dims(epoch_exp_pred_labels[this_cluster_node_idx], -1)
+                            # self.validation_step_debug_outputs["score_neighbors"] = score_neighbors
+                            # self.validation_step_debug_outputs["score_neighbors_label"] = score_neighbors_label
+                            # print(j, dynamic_neigh_num, score_neighbors.shape, is_score_neighbors_consistency.shape)
+                            neigh_consistency_score.append(np.mean(is_score_neighbors_consistency, axis=1))
+                            neigh_consistency_sum_score.append(np.sum(is_score_neighbors_consistency))
+                            neigh_consistency_sum_score_factor += this_cluster_node_idx.sum() * dynamic_neigh_num
+                        neigh_consistency_score = np.mean(np.concatenate(neigh_consistency_score))
+                        neigh_consistency_sum_score = np.sum(neigh_consistency_sum_score) / neigh_consistency_sum_score_factor
             # epoch_gt_labels = np.concatenate(epoch_gt_labels)
             # epoch_exp_att_x = np.concatenate(self.validation_step_outputs["epoch_exp_att_x"])
             # print("epoch_exp_latent", epoch_exp_latent[0].shape, epoch_exp_latent[-1].shape)
@@ -1660,72 +1444,62 @@ class GMVGAT(pl.LightningModule):
                 # )
 
                 if self.is_labelled:
-                    gt_tissue_graph_path, pred_tissue_graph_path = log_tissue_graph(
+                    gt_tissue_graph_path, _ = log_tissue_graph(
                         data_val=self.trainer.datamodule.data_val,
                         log_path=self.log_path,
                         current_epoch=self.current_epoch,
                         gt_labels=epoch_gt_labels,
                         pred_labels=epoch_exp_pred_labels,
-                        plot_gt=self.plot_gt,
+                        plot_gt=True,
+                        plot_pred=False
                     )
-                    if isinstance(self.logger, CometLogger):
-                        self.logger.experiment.log_image(pred_tissue_graph_path, "test/pred_tissue_graph_path")
-
+                # if isinstance(self.logger, CometLogger):
+                #     self.logger.experiment.log_image(gt_tissue_graph_path, "test/gt_tissue_graph_path")
+                self.plot_gt = False
             # if self.current_epoch % 100 == 0:
             # if self.current_epoch % 100 == 99:
             # if True:
             if self.is_labelled:
                 if self.current_epoch % 10 == 9:
-                    gt_tissue_graph_path, pred_tissue_graph_path = log_tissue_graph(
+                    _, pred_tissue_graph_path = log_tissue_graph(
                         data_val=self.trainer.datamodule.data_val,
                         log_path=self.log_path,
                         current_epoch=self.current_epoch,
                         gt_labels=epoch_gt_labels,
                         pred_labels=epoch_exp_pred_labels,
-                        plot_gt=self.plot_gt,
+                        plot_gt=False,
+                        plot_pred=True
                     )
-                    if isinstance(self.logger, CometLogger):
-                        self.logger.experiment.log_image(pred_tissue_graph_path, "test/pred_tissue_graph_path")
+                    # if isinstance(self.logger, CometLogger):
+                    #     self.logger.experiment.log_image(pred_tissue_graph_path, "test/pred_tissue_graph_path")
 
             epoch_exp_pred_label_values, epoch_exp_pred_label_counts = np.unique(epoch_exp_pred_labels, return_counts=True)
             print(epoch_exp_pred_label_values, epoch_exp_pred_label_counts)
-            # if self.is_labelled:
-            #     if self.rec_neigh_num and (not self.max_dynamic_neigh or (self.max_dynamic_neigh and self.dynamic_neigh_level == Dynamic_neigh_level.domain)):
-            #         print("Epoch", self.current_epoch, "exp_ARI:", exp_ARI, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-            #     else:
-            #         print("Epoch", self.current_epoch, "exp_ARI:", exp_ARI, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-            #     self.log("test/cluster_num", float(len(epoch_exp_pred_label_values)), on_step=False, on_epoch=True, prog_bar=False)
-            #     self.log("test/min_cluster_node_num", float(epoch_exp_pred_label_counts.min()), on_step=False, on_epoch=True, prog_bar=False)
-            #     self.log("test/highest_exp_ARI", self.highest_exp_ARI, on_step=False, on_epoch=True, prog_bar=False)
+            if self.is_labelled:
+                if self.rec_neigh_num and self.dynamic_neigh_level == Dynamic_neigh_level.domain:
+                    print("Epoch", self.current_epoch, "exp_ARI:", exp_ARI, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+                else:
+                    print("Epoch", self.current_epoch, "exp_ARI:", exp_ARI, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+                self.log("test/cluster_num", float(len(epoch_exp_pred_label_values)), on_step=False, on_epoch=True, prog_bar=False)
+                self.log("test/min_cluster_node_num", float(epoch_exp_pred_label_counts.min()), on_step=False, on_epoch=True, prog_bar=False)
+                self.log("test/highest_exp_ARI", self.highest_exp_ARI, on_step=False, on_epoch=True, prog_bar=False)
+            else:
+                if self.rec_neigh_num:
+                    if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
+                        if neigh_consistency_sum_score != 0:
+                            print("Epoch", self.current_epoch, "neigh_consist:", neigh_consistency_score, "neigh_consist_sum:", neigh_consistency_sum_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+                        print("Epoch", self.current_epoch, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+                    elif self.dynamic_neigh_level.name.startswith("unit"):
+                        print("Epoch", self.current_epoch, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+                else:
+                    print("Epoch", self.current_epoch, "curr_time:", datetime.now().strftime("%H:%M:%S"))
+
             if self.rec_neigh_num:
                 if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
-                    if self.max_dynamic_neigh and neigh_consistency_sum_score != 0:
-                        print("Epoch", self.current_epoch, "neigh_consist:", neigh_consistency_score, "neigh_consist_sum:", neigh_consistency_sum_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-                    print("Epoch", self.current_epoch, "neigh_consistency:", neigh_consistency_score, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-                elif self.dynamic_neigh_level.name.startswith("unit"):
-                    print("Epoch", self.current_epoch, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-            else:
-                print("Epoch", self.current_epoch, "curr_time:", datetime.now().strftime("%H:%M:%S"))
-
-            # Visualize latent space.
-            # result_tsne_figure_path = log_tsne_figure(
-            #     labels=labels,
-            #     latent=(torch.squeeze(latent) * torch.squeeze(prob_cat.transpose(1, 2)).unsqueeze(-1)).sum(0),
-            #     log_path=self.log_path,
-            # )
-
-            if self.rec_neigh_num:
-                if not self.max_dynamic_neigh or (self.max_dynamic_neigh and self.dynamic_neigh_level == Dynamic_neigh_level.domain):
                     self.log("test/neigh_consistency_score", neigh_consistency_score, on_step=False, on_epoch=True, prog_bar=False)
-                    if self.max_dynamic_neigh:
-                        if neigh_consistency_sum_score != 0.:
-                            self.log("test/neigh_consistency_sum_score", neigh_consistency_sum_score, on_step=False, on_epoch=True, prog_bar=False)
-            if self.plot_gt:
-                if isinstance(self.logger, CometLogger):
-                    # self.logger.experiment.log_image(gt_exp_graph_path, "test/gt_exp_graph_path")
-                    # self.logger.experiment.log_image(gt_sp_graph_path, "test/gt_sp_graph_path")
-                    self.logger.experiment.log_image(gt_tissue_graph_path, "test/gt_tissue_graph_path")
-                self.plot_gt = False
+                    if neigh_consistency_sum_score != 0.:
+                        self.log("test/neigh_consistency_sum_score", neigh_consistency_sum_score, on_step=False, on_epoch=True, prog_bar=False)
+
         self.validation_step_outputs.clear()
         if self.debug:
             pass
@@ -1868,18 +1642,6 @@ class GMVGAT(pl.LightningModule):
             return whether_consistent, x_consistent_idx, x_consistent_weight, neigh_consistent_idx, neigh_consistent_weight, x_inconsistent_idx, pesudo_labels
         return whether_consistent, x_consistent_idx, x_consistent_weight, neigh_consistent_idx, neigh_consistent_weight
 
-    def semi_sup_loss(self, out_net, neigh_out_net=None):
-        assert self.add_cat_bias is False
-        logits, prob_cat = out_net['logits'], out_net['prob_cat']
-        whether_consistent, x_consistent_idx, x_consistent_weight, neigh_consistent_idx, neigh_consistent_weight, x_inconsistent_idx, pesudo_labels = self.get_consistency(prob_cat, neigh_out_net, get_incosistency=True)
-        # if True:
-        #     print("prob_cat[x_inconsistent_idx].shape", prob_cat[x_inconsistent_idx].shape)
-        #     print("pesudo_labels.shape", pesudo_labels.shape)
-        if self.is_well_initialized:
-            # semi_super_loss = CrossEntropyLoss()(prob_cat[x_inconsistent_idx], pesudo_labels)
-            semi_super_loss = CrossEntropyLoss()(logits[x_inconsistent_idx], pesudo_labels)
-        return semi_super_loss
-
     def cluster_init_loss(self, out_net, cluster_labels=None, output_nodes_idx=None, degree="just"):
         if output_nodes_idx is not None:
             logits, prob_cat = out_net['logits'][output_nodes_idx], out_net['prob_cat'][output_nodes_idx]
@@ -1902,3 +1664,14 @@ class GMVGAT(pl.LightningModule):
                     raise NotImplementedError
             cluster_init_loss = CrossEntropyLoss(reduction="sum")(logits[need_init_idx], cluster_labels[need_init_idx])
         return cluster_init_loss
+    def semi_sup_loss(self, out_net, neigh_out_net=None):
+        assert self.add_cat_bias is False
+        logits, prob_cat = out_net['logits'], out_net['prob_cat']
+        whether_consistent, x_consistent_idx, x_consistent_weight, neigh_consistent_idx, neigh_consistent_weight, x_inconsistent_idx, pesudo_labels = self.get_consistency(prob_cat, neigh_out_net, get_incosistency=True)
+        # if True:
+        #     print("prob_cat[x_inconsistent_idx].shape", prob_cat[x_inconsistent_idx].shape)
+        #     print("pesudo_labels.shape", pesudo_labels.shape)
+        if self.is_well_initialized:
+            # semi_super_loss = CrossEntropyLoss()(prob_cat[x_inconsistent_idx], pesudo_labels)
+            semi_super_loss = CrossEntropyLoss()(logits[x_inconsistent_idx], pesudo_labels)
+        return semi_super_loss

@@ -29,6 +29,14 @@ model:
   exp_encoder_channels: [3000, 128, 256, 64]
   exp_decoder_channels: [64, 256, 128, 3000]
 
+  # the number of spatially variable genes to detect for each domain
+  detect_svg: 50
+
+  # a simple autoencoder will be used to refine the predicted domain labels (saved in obs["mlp_fit"])
+  # the raw predicted domain labels will NOT be overwritten and are saved in obs["pred_labels"]
+  # set to null to disable the refinement (recommend to disable it for large datasets with > 100k units)
+  refine_ae_channels: [64, 64, 64]
+
   # weight for neighbor loss, higher weights will make the predicted domains smoother
   exp_neigh_w: 1.
 

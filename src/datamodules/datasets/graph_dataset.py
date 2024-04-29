@@ -34,6 +34,7 @@ class GraphDataset(Dataset):
         out_type: str = "raw",
         compared_type: str = "raw",
         count_key=None,
+        annotation_key=None,
         num_classes="auto",
         data_file_name=None,
         num_hvg: int = 2048,
@@ -57,6 +58,7 @@ class GraphDataset(Dataset):
         sample_id: str = "sample_id",
         multi_slides=False,
         z_scale: float = 2.,
+        resample_to=None,
         use_ddp=False,
         weighted_neigh=False,
         supervise_cat=False,
@@ -70,7 +72,7 @@ class GraphDataset(Dataset):
         self.out_type = out_type
         self.compared_type = compared_type
         self.count_key = count_key
-        self.annotation_key = None
+        self.annotation_key = annotation_key
         self.num_classes = num_classes
         self.data_file_name = data_file_name
         self.num_hvg = num_hvg
@@ -105,6 +107,7 @@ class GraphDataset(Dataset):
         self.sample_id = str(sample_id)
         self.multi_slides = multi_slides
         self.z_scale = z_scale
+        self.resample_to = resample_to
         self.full_adata = None
 
         if self.data_type == '10x':
@@ -118,84 +121,11 @@ class GraphDataset(Dataset):
         self.compute_out_log_sigma()
         if self.rec_mask_neigh_threshold:
             self.get_rec_mask()
-        if self.forward_neigh_num:
-            self.get_item_rng = np.random.default_rng(seed)
-            if self.rec_neigh_num:
-                # forward_neigh_order 1 x K2
-                # rec_forward_neigh_order K1 x K2
-                # (K1 + 1) x K2
-                self.rng_input = np.broadcast_to(np.expand_dims(np.arange(self.forward_neigh_num), 0), (self.rec_neigh_num + 1, self.forward_neigh_num))
-            else:
-                # forward_neigh_order 1 x K2
-                self.rng_input = np.expand_dims(np.arange(self.forward_neigh_num), 0)
-            self.torch_rng_input = torch.from_numpy(self.rng_input.copy()).to(torch.long)
 
         gc.collect()
 
     def __getitem__(self, index: int):
-        if not self.max_dynamic_neigh:
-            # print("getitem begin")
-            exp_feature, exp_rec_feature = get_io_feature(self.adata, self.in_type, self.out_type, self.count_key)
-
-            ret_dict = {
-                'index': index,
-                'exp_feature': exp_feature[index],
-                'exp_rec_feature': exp_rec_feature[index],
-            }
-            if self.supervise_cat == "random":
-                ret_dict['cat'] = self.adata[index].obs['random_label'].to_numpy().squeeze(0)
-            elif self.supervise_cat is True:
-                ret_dict['cat'] = self.adata[index].obs[f"{self.annotation_key}_int"].to_numpy().squeeze(0)
-            if self.rec_mask_neigh_threshold:
-                ret_dict["exp_rec_mask"] = self.adata.layers["rec_mask"][index]
-            if self.rec_neigh_num or self.forward_neigh_num:
-                if self.forward_neigh_num:
-                    if self.exchange_forward_neighbor_order:
-                        sampled_order = np.apply_along_axis(self.get_item_rng.permutation, axis=1, arr=self.rng_input)
-                        torch_sampled_order = torch.from_numpy(sampled_order).to(torch.long)
-                    else:
-                        sampled_order = self.rng_input
-                        torch_sampled_order = self.torch_rng_input
-                    forward_neigh_order = sampled_order[0]
-                    rec_forward_neigh_order = sampled_order[1:]
-                    torch_forward_neigh_order = torch_sampled_order[0]
-                    torch_rec_forward_neigh_order = torch_sampled_order[1:]
-                # N x D
-                ref_attr = exp_feature
-                # K1 x D
-                if self.rec_neigh_num:
-                    rec_neigh_attr = exp_feature[self.rec_neigh_idx[index], :]
-                # K2 x D
-                if self.forward_neigh_num:
-                    forward_neigh_attr = exp_feature[self.forward_neigh_idx[index], :]
-                # K2 x 2
-                # sp_forward_neigh_attr = self.adata.obsm['spatial'][self.forward_neigh_idx[index], :]
-                # K1
-                if self.rec_neigh_num:
-                    if self.weighted_neigh:
-                        neigh_affi = self.normalized_gaussian_kernel(np.sqrt(np.square(rec_neigh_attr - ref_attr[[index]]).sum(-1)))
-                        ret_dict['exp_rec_neigh_affi'] = neigh_affi
-
-                if self.rec_neigh_num:
-                    ret_dict['exp_rec_neigh_feature'] = rec_neigh_attr
-                    if self.supervise_cat == "random":
-                        ret_dict['rec_cat'] = self.adata[self.rec_neigh_idx[index].flatten()].obs['random_label'].to_numpy()
-                    elif self.supervise_cat:
-                        ret_dict['rec_cat'] = self.adata[self.rec_neigh_idx[index].flatten()].obs[f"{self.annotation_key}_int"].to_numpy()
-                if self.forward_neigh_num:
-                    ret_dict['exp_forward_neigh_feature'] = forward_neigh_attr[forward_neigh_order]
-                if self.rec_neigh_num and self.forward_neigh_num:
-                    # K1 x K2 x D
-                    rec_forward_neigh_attr = exp_feature[self.rec_forward_neigh_idx[index], :]
-                    # K1 x K2 x 2
-                    # sp_rec_forward_neigh_attr = self.adata.obsm['spatial'][self.rec_forward_neigh_idx[index], :]
-                    # K x K
-                    # if self.weighted_neigh:
-                    #     rec_neigh_affi = self.normalized_gaussian_kernel(np.sqrt(np.square(rec_forward_neigh_attr - np.expand_dims(forward_neigh_attr, 1)).sum(-1)))
-                    # else:
-                    #     rec_neigh_affi = np.ones(self.rec_neigh_num, self.rec_neigh_num)
-                    ret_dict['exp_rec_forward_neigh_feature'] = np.take_along_axis(rec_forward_neigh_attr, indices=rec_forward_neigh_order[:, :, np.newaxis], axis=1)
-            return ret_dict
+        return
 
     def __len__(self):
         return len(self.adata)
@@ -221,29 +151,6 @@ class GraphDataset(Dataset):
         if 'X_pca' in self.adata.obsm.keys():
             assert isinstance(self.adata.obsm['X_pca'], np.ndarray)
         assert isinstance(self.adata.obsm['spatial'], np.ndarray)
-        if self.rec_neigh_num:
-            # sp_rec_neigh_adj = self.adata.obsm['sp_rec_adj']
-            # N x K1
-            # self.rec_neigh_idx = sp_rec_neigh_adj.nonzero()[1].reshape(len(self.adata.X), self.rec_neigh_num)
-            self.rec_neigh_idx = self.adata.obsm['sp_k'][:, :self.rec_neigh_num]
-            self.torch_rec_neigh_idx = torch.from_numpy(self.rec_neigh_idx).to(torch.long)
-        if self.forward_neigh_num:
-            # sp_forward_neigh_adj = self.adata.obsm['sp_forward_adj']
-            # N x K2
-            # self.forward_neigh_idx = sp_forward_neigh_adj.nonzero()[1].reshape(len(self.adata.X), self.forward_neigh_num)
-            self.forward_neigh_idx = self.adata.obsm['sp_k'][:, :self.forward_neigh_num]
-            self.torch_forward_neigh_idx = torch.from_numpy(self.forward_neigh_idx).to(torch.long)
-        if self.rec_neigh_num and self.forward_neigh_num:
-            # rec_forward_neigh_idx = np.nonzero(sp_neighbors_adj[rec_neigh_idx, :])[2].reshape(len(self.adata.X), self.rec_neigh_num, self.rec_neigh_num)
-            # rec_forward_neigh_idx = sp_neighbors_adj[rec_neigh_idx, :].nonzero()[2].reshape(len(self.adata.X), self.rec_neigh_num, self.rec_neigh_num) # will be supported in future scipy
-            # N x K1 x K2
-            self.rec_forward_neigh_idx = self.forward_neigh_idx[self.rec_neigh_idx]
-            # self.rec_forward_neigh_idx = []
-            # # for i in trange(self.rec_neigh_num):
-            # for i in range(self.rec_neigh_num):
-            #     self.rec_forward_neigh_idx.append(sp_forward_neigh_adj[self.rec_neigh_idx[:, i]].nonzero()[1].reshape(len(self.adata.X), self.forward_neigh_num))
-            # self.rec_forward_neigh_idx = np.stack(self.rec_forward_neigh_idx, axis=1)
-            self.torch_rec_forward_neigh_idx = torch.from_numpy(self.rec_forward_neigh_idx).to(torch.long)
 
     def get_gt_neighbors(self, expected_row_repeat_time):
         ks = np.array(self.hexagonal_num_list)
@@ -315,13 +222,19 @@ class GraphDataset(Dataset):
         if self.dynamic_neigh_level == Dynamic_neigh_level.domain:
             self.dynamic_neigh_nums = [self.k] * self.num_classes
         elif self.dynamic_neigh_level.name.startswith("unit"):
-            if not self.dynamic_neigh_level.name.startswith("unit_fix_domain"):
-                self.dynamic_neigh_nums = [self.k] * len(self.adata)
-            else:
+            if self.dynamic_neigh_level.name.startswith("unit_fix_domain"):
                 self.dynamic_neigh_nums = [self.unit_fix_num] * len(self.adata)
+            else:
+                self.dynamic_neigh_nums = [self.k] * len(self.adata)
 
     # @profile
-    def preprocess_data(self, filter_by_counts=True, reuse_existing_pca=False, reuse_existing_knn=False):
+    def preprocess_data(self, filter_by_counts=True, reuse_existing_pca=False, reuse_existing_knn=False, max_scale_value=None, not_labelled_value=None):
+        if self.resample_to:
+            resample_idx = self.rng.integers(len(self.adata), size=self.resample_to)
+            self.adata = self.adata[resample_idx, :].copy()
+            # self.adata = self.adata + np.abs(self.rng.normal(10, 10, self.adata.X.shape))
+            self.adata.obs["resample_idx"] = resample_idx
+
         if self.annotation_key is not None:
             self.adata.obs[f"{self.annotation_key}"] = pd.Categorical(self.adata.obs[f"{self.annotation_key}"])
             sorted_cluster_idx = self.adata.obs[f"{self.annotation_key}"].value_counts().sort_index().index
@@ -337,7 +250,10 @@ class GraphDataset(Dataset):
                     # from sklearn.metrics import adjusted_rand_score
                     # raise ValueError(f"Random label ARI: {adjusted_rand_score(self.adata.obs[f'{self.annotation_key}_int'], self.adata.obs['random_label'])}")
             self.adata.obs[f"{self.annotation_key}_int"] = self.adata.obs[f"{self.annotation_key}_int"].astype(np.int32)
-            self.adata.obs['is_labelled'] = ~self.adata.obs[f"{self.annotation_key}"].isna()
+            if not_labelled_value is not None:
+                self.adata.obs['is_labelled'] = self.adata.obs[f"{self.annotation_key}"] != not_labelled_value
+            else:
+                self.adata.obs['is_labelled'] = ~self.adata.obs[f"{self.annotation_key}"].isna()
             if self.test_with_gt_sp:
                 self.adata = self.adata[~self.adata.obs[f"{self.annotation_key}"].isna(), :].copy()
         assert self.adata.obsm['spatial'] is not None
@@ -398,7 +314,10 @@ class GraphDataset(Dataset):
             self.adata.layers['unscaled'] = self.adata.X.copy()
             logging.debug("Scaling data.")
             tic = time.time()
-            sc.pp.scale(self.adata)
+            if max_scale_value is not None:
+                sc.pp.scale(self.adata)
+            else:
+                sc.pp.scale(self.adata, max_value=max_scale_value)
             # sc.pp.scale(self.adata, zero_center=False, max_value=10)
             self.adata.var['mean'] = self.adata.var['mean'].astype(np.float32)
             self.adata.var['std'] = self.adata.var['std'].astype(np.float32)
@@ -433,18 +352,16 @@ class GraphDataset(Dataset):
             self.adata.uns["r"] = popt[0]
         else:
             self.adata.uns["r"] = -1
-        self.adata.obs["pred_labels"] = 0
-        self.adata = self.adata.copy()
         self.set_class_num()
-        if self.max_dynamic_neigh:
-            self.init_neighs_num()
+        self.adata.obs["pred_labels"] = 0
+        self.adata.obsm["prob_cat"] = np.zeros((len(self.adata), self.num_classes), dtype=np.float32)
+        self.adata.obsm["prob_cat"][:, 0] = 1.
+        self.adata = self.adata.copy()
+        self.init_neighs_num()
         logging.debug("Computing spatial nearest neighbors.")
         tic = time.time()
         if not self.test_with_gt_sp:
-            if self.max_dynamic_neigh:
-                neigh = NearestNeighbors(n_neighbors=self.max_dynamic_neigh, n_jobs=self.n_jobs)
-            else:
-                neigh = NearestNeighbors(n_neighbors=max(self.rec_neigh_num, self.forward_neigh_num), n_jobs=self.n_jobs)
+            neigh = NearestNeighbors(n_neighbors=self.max_dynamic_neigh, n_jobs=self.n_jobs)
             if (self.data_type == "10x" and len(self.sample_id.split('_')) > 1 and (not self.sample_id.startswith("GSM"))):
                 neigh.fit(self.adata[self.adata.obs["batch"] == 0].obsm['spatial'])
                 first_slide_sp_dist, _ = neigh.kneighbors(return_distance=True)
@@ -460,27 +377,31 @@ class GraphDataset(Dataset):
         else:
             if len(self.sample_id.split('_')) > 1:
                 raise NotImplementedError
-            if self.max_dynamic_neigh:
-                gt_neighbor_dist, gt_neighbors, gt_neighbor_graph = self.get_gt_neighbors(expected_row_repeat_time=self.max_dynamic_neigh)
-            else:
-                gt_neighbor_dist, gt_neighbors, gt_neighbor_graph = self.get_gt_neighbors(expected_row_repeat_time=max(self.rec_neigh_num, self.forward_neigh_num))
+            gt_neighbor_dist, gt_neighbors, gt_neighbor_graph = self.get_gt_neighbors(expected_row_repeat_time=self.max_dynamic_neigh)
             self.adata.obsm['sp_k'] = gt_neighbors
             self.adata.obsm['sp_dist'] = gt_neighbor_dist
         self.adata.obsm['sp_dist'] = self.adata.obsm['sp_dist'].astype(np.float32)
-        if self.max_dynamic_neigh:
-            if self.supervise_cat or self.exchange_forward_neighbor_order:
-                raise NotImplementedError
-            if not self.test_with_gt_sp:
-                self.adata.obsm['sp_adj'] = neigh.kneighbors_graph()
-            else:
-                self.adata.obsm['sp_adj'] = gt_neighbor_graph
-            self.adata.obsm["consist_adj"] = np.ones_like(self.adata.obsm["sp_k"]).astype(np.bool_)
+        if self.supervise_cat or self.exchange_forward_neighbor_order:
+            raise NotImplementedError
+        if not self.test_with_gt_sp:
+            self.adata.obsm['sp_adj'] = neigh.kneighbors_graph()
+        else:
+            self.adata.obsm['sp_adj'] = gt_neighbor_graph
+        self.adata.obsm["consist_adj"] = np.ones_like(self.adata.obsm["sp_k"]).astype(np.bool_)
         toc = time.time()
         logging.debug(f"Computing spatial nearest neighbors takes {(toc - tic)/60:.2f} mins.")
         gc.collect()
 
     def get_custom_data(self):
         self.adata = sc.read_h5ad(osp.join(self.data_dir, self.dataset_dir, self.data_file_name))
+        if "counts" in self.adata.layers.keys():
+            self.count_key = "counts"
+        elif "count" in self.adata.layers.keys():
+            self.count_key = "count"
+        else:
+            self.count_key = "counts"
+            print("No count key found in layers, using default adata.X as count data.")
+            self.adata.layers[self.count_key] = self.adata.X.copy()
         self.preprocess_data()
 
     def get_10x_data(self):

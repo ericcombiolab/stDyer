@@ -149,3 +149,8 @@ wandb/
 checkpoints/
 
 *.nfs*
+
+run_CTL.sh
+configs/experiment/example_test.yaml
+configs/experiment/example_ctl*.yaml
+py_inference_ctl.ipynb
