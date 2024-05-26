@@ -66,4 +66,7 @@ To train with a dataset with multiple slides, you need to first align the datase
 
 ```bash
 python run.py experiment=example_multi_slides.yaml
-```bash
+```
+
+### For reproducing the results in the paper
+You can check https://doi.org/10.5281/zenodo.11315102 to download the processed data and reproducible Jupyter notebooks. Please read the README.md inside the zip file for details.

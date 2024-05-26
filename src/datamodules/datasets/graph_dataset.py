@@ -271,6 +271,9 @@ class GraphDataset(Dataset):
 
         if filter_by_counts:
             sc.pp.filter_genes(self.adata, min_counts=1)
+            if self.dataset_dir == "CTL":
+                sc.pp.filter_genes(self.adata, min_cells=100)
+                sc.pp.filter_genes(self.adata, min_counts=500)
             sc.pp.filter_cells(self.adata, min_counts=1)
         toc = time.time()
         logging.debug(f"Filtering genes and cells takes {(toc - tic)/60:.2f} mins.")
@@ -417,7 +420,7 @@ class GraphDataset(Dataset):
         self.adata = sc.read_h5ad(exp_file_path)
         toc = time.time()
         logging.debug(f"Loading data takes {(toc - tic)/60:.2f} mins.")
-        self.annotation_key = "annotation"
         if self.sample_id in ["E12.5_E1S3.MOSTA", "E14.5_E1S3.MOSTA", "E16.5_E1S3.MOSTA", "E16.5_E2S1.MOSTA", "E16.5_E2S2.MOSTA", "E16.5_E2S3.MOSTA", "E16.5_E2S4.MOSTA", "E16.5_E2S5.MOSTA", "E16.5_E2S6.MOSTA", "E16.5_E2S7.MOSTA", "E16.5_E2S8.MOSTA", "E16.5_E2S9.MOSTA", "E16.5_E2S10.MOSTA", "E16.5_E2S11.MOSTA", "E16.5_E2S12.MOSTA", "E16.5_E2S13.MOSTA"]:
+            self.annotation_key = "annotation"
             self.count_key = "count"
         self.preprocess_data()
