@@ -8,16 +8,18 @@ from torch import nn
 
 class GumbelSoftmax(nn.Module):
 
-  def __init__(self, f_dim, y_dim, activation=nn.ELU()):
+  def __init__(self, f_dim, y_dim, activation=nn.ELU(), connect_prior=False, device=None):
     super(GumbelSoftmax, self).__init__()
+    self.device = device
+    self.connect_prior = connect_prior
+    self.softmax = nn.Softmax(dim=-1)
     self.before_logits = nn.Linear(f_dim, f_dim)
     self.before_logits_act = activation
     self.logits = nn.Linear(f_dim, y_dim) # do not consider spatial information
     # self.before_logits = nn.Linear(f_dim, 2 * f_dim)
     # self.before_logits_act = nn.ReLU()
     # self.logits = nn.Linear(2 * f_dim, y_dim) # do not consider spatial information
-    self.softmax = nn.Softmax(dim=-1)
-    self.log_softmax = nn.LogSoftmax(dim=-1)
+
     self.f_dim = f_dim
     self.y_dim = y_dim
 
@@ -76,14 +78,13 @@ class GumbelSoftmax(nn.Module):
         # B x C
         return logits.view(x.shape[0], self.y_dim), prob.view(x.shape[0], self.y_dim), y.view(x.shape[0], self.y_dim)
 
-
 class Gaussian(nn.Module):
-  def __init__(self, in_dim, z_dim, max_mu=10., max_logvar=5., min_logvar=-5., activation=nn.ELU(), kind="VVI", use_kl_bn=False, kl_bn_gamma=32., device=None):
+  def __init__(self, in_dim, z_dim, max_mu=10., max_logvar=5., min_logvar=-5., activation=nn.ELU(), skip_connection=False, kind="VVI", use_kl_bn=False, kl_bn_gamma=32., device=None):
     super(Gaussian, self).__init__()
     self.kind = kind
     self.use_kl_bn = use_kl_bn
     self.kl_bn_gamma = kl_bn_gamma
-    self.mu_1 = DenseBlock(in_dim, z_dim, activation=activation)
+    self.mu_1 = DenseBlock(in_dim, z_dim, activation=activation, skip_connection=skip_connection)
     self.mu_2 = nn.Linear(z_dim, z_dim)
     if self.use_kl_bn:
         self.bn = nn.BatchNorm1d(z_dim)
@@ -91,7 +92,7 @@ class Gaussian(nn.Module):
         self.bn.weight.fill_(self.kl_bn_gamma)
         self.bn.bias.requires_grad_(True)
     if kind == "VVI":
-        self.logvar_1 = DenseBlock(in_dim, z_dim, activation=activation)
+        self.logvar_1 = DenseBlock(in_dim, z_dim, activation=activation, skip_connection=skip_connection)
         self.logvar_2 = nn.Linear(z_dim, z_dim)
     elif kind == "EEE":
         from torch.nn.utils.parametrizations import orthogonal
@@ -172,6 +173,7 @@ class DenseBlock(nn.Module):
         out_features,
         use_bias=True,
         use_batch_norm=False,
+        skip_connection=False,
         activation=nn.ReLU(),
         dropout=0,
     ):
@@ -182,6 +184,7 @@ class DenseBlock(nn.Module):
         self.use_batch_norm = use_batch_norm
         if self.use_batch_norm:
             self.batch_norm = nn.BatchNorm1d(out_features)
+        self.skip_connection = skip_connection
         self.activation = activation
         self.dropout_rate = dropout
         if self.dropout_rate > 0:
@@ -195,6 +198,8 @@ class DenseBlock(nn.Module):
             elif output.ndim == 3:
                 C, B, D = output.shape # or B x K x D
                 output = self.batch_norm(output.view(-1, D)).view(C, B, D)
+        if self.skip_connection:
+            output = output + input
         if activation and self.activation is not None:
             output = self.activation(output)
         if self.dropout_rate > 0:

@@ -1,6 +1,7 @@
 from typing import List, Optional
 import os
 import os.path as osp
+import sys
 import hydra
 from omegaconf import DictConfig
 from pytorch_lightning import (
@@ -67,8 +68,7 @@ def train(config: DictConfig) -> Optional[float]:
 
     # Init lightning callbacks
     if "model_checkpoint" in config.callbacks:
-        if "dirpath" in config.callbacks.model_checkpoint and config.callbacks.model_checkpoint.dirpath is None:
-            config.callbacks.model_checkpoint.dirpath = osp.join(config.paths.log_dir, f"{logger[0].version}/checkpoints")
+        config.callbacks.model_checkpoint.dirpath = osp.join(config.paths.log_dir, f"{logger[0].version}/checkpoints")
     callbacks: List[Callback] = []
     if "callbacks" in config:
         for _, cb_conf in config.callbacks.items():
@@ -106,6 +106,40 @@ def train(config: DictConfig) -> Optional[float]:
     # Train the model
     log.info("Starting training!")
     trainer.fit(model=model, datamodule=datamodule)
+    log_versions = [trainer.model.stored_version]
+    ban_ckpt_list = []
+    last_normal_epoch_dict = trainer.model.last_normal_epoch_dict.copy()
+    while trainer.model.resume_from_ckpt_and_continue_train is True:
+        trainer.model.resume_from_ckpt_and_continue_train = False
+        trainer.should_stop = False
+        logger: List[Logger] = []
+        trainer.model.stored_version = None
+        if len(trainer.model.last_normal_epoch_dict) == 0:
+            trainer.fit(model=trainer.model, datamodule=trainer.datamodule)
+        else:
+            usable_ckpt_epoch_list = []
+            for last_normal_epoch, run_times in last_normal_epoch_dict.items():
+                if last_normal_epoch in ban_ckpt_list:
+                    continue
+                elif run_times >= 2:
+                    ban_ckpt_list.append(last_normal_epoch)
+                    continue
+                else:
+                    usable_ckpt_epoch_list.append(last_normal_epoch)
+            if len(usable_ckpt_epoch_list) == 0:
+                from collections import OrderedDict
+                trainer.model.last_normal_epoch_dict = OrderedDict()
+                last_normal_epoch_dict = OrderedDict()
+                trainer.model.stored_version = None
+                ban_ckpt_list = []
+                continue
+            else:
+                trainer.fit(model=trainer.model, datamodule=trainer.datamodule, ckpt_path=osp.join(config.logger.comet.save_dir, log_versions[0], "checkpoints", f"epoch_{usable_ckpt_epoch_list[-1]}.ckpt"))
+                last_normal_epoch_dict[usable_ckpt_epoch_list[-1]] += 1
+        if trainer.model.stored_version is None:
+            # reached the end of training (like max_epochs)
+            break
+        log_versions.append(trainer.model.stored_version)
 
     # Get metric score for hyperparameter optimization
     optimized_metric = config.get("optimized_metric")

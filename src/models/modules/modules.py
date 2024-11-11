@@ -68,6 +68,7 @@ class Encoder(nn.Module):
         use_bias=True,
         num_heads=1,
         activation=nn.ReLU(),
+        skip_connection=False,
         max_mu=10.,
         max_logvar=5.,
         min_logvar=-5.,
@@ -78,6 +79,8 @@ class Encoder(nn.Module):
         GMM_model_name="VVI",
         use_kl_bn=False,
         kl_bn_gamma=32.,
+        connect_prior=False,
+        in_type="scaled",
         adata=None,
         device=None,
         legacy=False,
@@ -106,9 +109,11 @@ class Encoder(nn.Module):
         self.GMM_model_name = GMM_model_name
         self.use_kl_bn = use_kl_bn
         self.kl_bn_gamma = kl_bn_gamma
+        self.in_type = in_type
         self.adata = adata
         self.legacy = legacy
         self.ig_pc = None
+        self.skip_connection = skip_connection
         if self.forward_neigh_num:
             self.multiplying_power = 2
         else:
@@ -130,7 +135,8 @@ class Encoder(nn.Module):
                                         out_features=item[1],
                                         use_bias=self.use_bias,
                                         use_batch_norm=self.use_batch_norm,
-                                        activation=self.activation
+                                        activation=self.activation,
+                                        skip_connection=self.skip_connection,
                                     )
                     q_module = DenseBlock(
                                     in_features=item[1],
@@ -169,7 +175,8 @@ class Encoder(nn.Module):
                                 out_features=item[1],
                                 use_bias=self.use_bias,
                                 use_batch_norm=self.use_batch_norm,
-                                activation=self.activation
+                                activation=self.activation,
+                                skip_connection=self.skip_connection,
                             )
                     )
             else:
@@ -179,21 +186,13 @@ class Encoder(nn.Module):
                         out_features=item[1],
                         use_bias=self.use_bias,
                         use_batch_norm=self.use_batch_norm,
-                        activation=self.activation
+                        activation=self.activation,
+                        skip_connection=self.skip_connection,
                     )
                 )
-        # self.encoder_y.append(
-        #     DenseBlock(
-        #         in_features=item[1],
-        #         out_features=item[1],
-        #         use_bias=self.use_bias,
-        #         use_batch_norm=self.use_batch_norm,
-        #         activation=None
-        #     )
-        # )
         # add softmax function at last layer.
         self.encoder_y.append(
-            GumbelSoftmax(self.out_channels[-1], self.y_dim, self.activation)
+            GumbelSoftmax(self.out_channels[-1], self.y_dim, self.activation, device=self.device)
         )
 
         # encode latent vectors.
@@ -214,7 +213,8 @@ class Encoder(nn.Module):
                             out_features=item[1],
                             use_bias=self.use_bias,
                             use_batch_norm=self.use_batch_norm,
-                            activation=self.activation
+                            activation=self.activation,
+                            skip_connection=self.skip_connection
                         )
                     )
                 else:
@@ -223,7 +223,8 @@ class Encoder(nn.Module):
                                     out_features=item[1],
                                     use_bias=self.use_bias,
                                     use_batch_norm=self.use_batch_norm,
-                                    activation=self.activation
+                                    activation=self.activation,
+                                    skip_connection=self.skip_connection,
                                 )
                     q_module = DenseBlock(
                                     in_features=item[1],
@@ -262,7 +263,8 @@ class Encoder(nn.Module):
                         out_features=item[1],
                         use_bias=self.use_bias,
                         use_batch_norm=self.use_batch_norm,
-                        activation=self.activation
+                        activation=self.activation,
+                        skip_connection=self.skip_connection,
                     )
                 )
                 if index == len(self.in_channels) - 1:
@@ -296,7 +298,7 @@ class Encoder(nn.Module):
                         )
         # add reparameterize.
         self.encoder_z.append(
-            Gaussian(self.out_channels[-1], self.z_dim, self.max_mu, self.max_logvar, self.min_logvar, self.activation, kind=self.GMM_model_name, use_kl_bn=self.use_kl_bn, kl_bn_gamma=self.kl_bn_gamma, device=self.device)
+            Gaussian(self.out_channels[-1], self.z_dim, self.max_mu, self.max_logvar, self.min_logvar, self.activation, self.skip_connection, kind=self.GMM_model_name, use_kl_bn=self.use_kl_bn, kl_bn_gamma=self.kl_bn_gamma, device=self.device)
         )
 
     def src_dot_dst(self, src_field, dst_field, out_field):
@@ -319,7 +321,7 @@ class Encoder(nn.Module):
         g.update_all(fn.u_mul_e(v, 'score', v), fn.sum(v, 'wv'))
 
     # @profile
-    def encode_y(self, x, neighbor_x=None):
+    def encode_y(self, x, neighbor_x=None, prior_y=None):
         common_embed = None
         if neighbor_x is not None and isinstance(neighbor_x, torch.Tensor):
             B, K, G = neighbor_x.shape
@@ -379,6 +381,7 @@ class Encoder(nn.Module):
                         x.srcdata.update({'key': layer[2](x.srcdata['embed'])})
                         # x.apply_edges(fn.v_dot_u('query', 'key', 'att'))
                         # x.edata["att"] = x.edata["att"] / self.scale_factor
+                        self.scale_factor = self.scale_factor.to(x.dstdata['embed'].dtype)
                         self.propagate_attention(x, q="query", k="key", v="embed")
                         # x.apply_edges(fn.u_add_v('exp_feature', 'exp_feature', 'out'))
                         # x.apply_edges(lambda edges: {'neighbor_self_x': torch.cat([edges.src['exp_feature'], edges.dst['exp_feature']], -1)})
@@ -507,6 +510,7 @@ class Encoder(nn.Module):
                                         x.srcdata.update({'key': layer[2](x.srcdata['embed'])})
                                         # x.apply_edges(fn.v_dot_u('query', 'key', 'att'))
                                         # x.edata["att"] = x.edata["att"] / self.scale_factor
+                                        self.scale_factor = self.scale_factor.to(x.dstdata['embed'].dtype)
                                         self.propagate_attention(x, q="query", k="key", v="embed")
                                         # x.apply_edges(fn.u_add_v('exp_feature', 'exp_feature', 'out'))
                                         # x.apply_edges(lambda edges: {'neighbor_self_x': torch.cat([edges.src['exp_feature'], edges.dst['exp_feature']], -1)})
@@ -558,11 +562,12 @@ class Encoder(nn.Module):
                 # B x C x N x D
                 return torch.stack(mus, dim=1), torch.stack(logvars, dim=1), torch.stack(zs, dim=1), None
     # @profile
-    def forward(self, x, neighbor_x=None, perform_ig=False):
+    def forward(self, x, neighbor_x=None, prior_y=None, perform_ig=False):
         if perform_ig is False:
             logits, prob, y, att_x, common_embed = self.encode_y(
                 x=x,
                 neighbor_x=neighbor_x,
+                prior_y=prior_y,
             )
             mus, logvars, zs, var_invs = self.encode_zs(
                 x=x,
@@ -571,24 +576,27 @@ class Encoder(nn.Module):
             )
         else:
             assert neighbor_x is None
-            # if "pca" in self.adata.uns:
-            #     if self.ig_pc is None:
-            #         self.ig_pc = torch.from_numpy(self.adata.uns["pca"].components_.T.copy()).float().requires_grad_().to(x.device)
-            #     x_pca = torch.matmul(x[:, 0, :], self.ig_pc)
-            #     neighbor_x_pca = torch.matmul(x[:, 1:, :], self.ig_pc)
-            #     # print("x_pca.shape", x_pca.shape)
-            #     # print("neighbor_x_pca.shape", neighbor_x_pca.shape)
-            #     logits, prob, y, att_x, common_embed = self.encode_y(
-            #         x=x_pca,
-            #         neighbor_x=neighbor_x_pca,
-            #     )
-            # else:
-            x_extracted = x[:, 0, :]
-            neighbor_x_extracted = x[:, 1:, :]
-            logits, prob, y, att_x, common_embed = self.encode_y(
-                x=x_extracted,
-                neighbor_x=neighbor_x_extracted,
-            )
+            if self.in_type.startswith("pca"):
+                if "pca" in self.adata.uns:
+                    if self.ig_pc is None:
+                        self.ig_pc = torch.from_numpy(self.adata.uns["pca"].components_.T.copy()).float().requires_grad_().to(x.device)
+                x_pca = torch.matmul(x[:, 0, :], self.ig_pc)
+                neighbor_x_pca = torch.matmul(x[:, 1:, :], self.ig_pc)
+                # print("x_pca.shape", x_pca.shape)
+                # print("neighbor_x_pca.shape", neighbor_x_pca.shape)
+                logits, prob, y, att_x, common_embed = self.encode_y(
+                    x=x_pca,
+                    neighbor_x=neighbor_x_pca,
+                    prior_y=prior_y,
+                )
+            else:
+                x_extracted = x[:, 0, :]
+                neighbor_x_extracted = x[:, 1:, :]
+                logits, prob, y, att_x, common_embed = self.encode_y(
+                    x=x_extracted,
+                    neighbor_x=neighbor_x_extracted,
+                    prior_y=prior_y,
+                )
 
         # print("y.sum(), mus.sum(), logvars.sum(), zs.sum(), logits.sum(), prob.sum()",
         #        y.sum(), mus.sum(), logvars.sum(), zs.sum(), logits.sum(), prob.sum())
@@ -597,6 +605,65 @@ class Encoder(nn.Module):
             return y, mus, logvars, zs, var_invs, logits, prob, att_x
         else:
             return prob
+
+class Prior(nn.Module):
+    def __init__(self,
+                 y_dim,
+                 z_dim,
+                 skip_connection=False,
+                 prior_generator="fc",
+                 GMM_model_name="VVI",
+                 activation=nn.ReLU(),
+                 device=None,
+                 ):
+        super(Prior, self).__init__()
+        self.y_dim = y_dim
+        self.z_dim = z_dim
+        self.skip_connection = skip_connection
+        self.prior_generator = prior_generator
+        self.GMM_model_name = GMM_model_name
+        self.activation = activation
+        self.device = device
+        self.onehot_y = F.one_hot(torch.arange(self.y_dim), self.y_dim).float().to(self.device)
+
+        # p(z|y)s
+        if self.prior_generator.startswith("fc"):
+            self.y_mus_1 = DenseBlock(y_dim, z_dim, activation=activation, skip_connection=self.skip_connection)
+            self.y_mus_2 = nn.Linear(z_dim, z_dim)
+            if self.GMM_model_name == "VVI":
+                self.y_logvars_1 = DenseBlock(y_dim, z_dim, activation=activation, skip_connection=self.skip_connection)
+                self.y_logvars_2 = nn.Linear(z_dim, z_dim)
+        elif self.prior_generator.startswith("tensor"):
+            self.mu_prior = nn.Parameter((torch.rand((y_dim, z_dim), device=self.device, requires_grad=True) - 0.5) * 2 * np.sqrt(6 / (y_dim + z_dim)))
+            if self.GMM_model_name == "VVI":
+                self.logvar_prior = nn.Parameter((torch.rand((y_dim, z_dim), device=self.device, requires_grad=True) - 0.5) * 2 * np.sqrt(6 / (y_dim + z_dim)))
+            elif self.GMM_model_name == "EEE":
+                self.logvar_prior = None
+
+    # @profile
+    def get_prior_mu_logvar(self, x, onehot_idx=None):
+        x_dtype = x.dstdata["exp_feature"].dtype if isinstance(x, DGLBlock) else x.dtype
+        if onehot_idx is None:
+            onehot_y = self.onehot_y.to(x_dtype)
+        else:
+            onehot_y = torch.zeros((1, self.y_dim), device=self.device, dtype=x_dtype)
+            onehot_y[0, onehot_idx] = 1
+        y_mus = self.y_mus_2(self.y_mus_1(onehot_y))
+        # ret_dict = {"prior_mu": y_mus}
+        if self.GMM_model_name == "VVI":
+            y_logvars = self.y_logvars_2(self.y_logvars_1(onehot_y))
+        elif self.GMM_model_name == "EEE":
+            y_logvars = None
+        # ret_dict["prior_logvar"] = y_logvars
+        # return ret_dict
+        return y_mus, y_logvars
+
+    def forward(self, x):
+        if self.prior_generator.startswith("fc"):
+            y_mus, y_logvars = self.get_prior_mu_logvar(x)
+        elif self.prior_generator.startswith("tensor"):
+            y_mus, y_logvars = self.mu_prior, self.logvar_prior
+        return y_mus, y_logvars
 
 class Decoder(nn.Module):
     """Decoder estimates distribution parameters based
@@ -614,10 +681,13 @@ class Decoder(nn.Module):
                  rec_type,
                  r_type='gene-wise',
                  activation=nn.ReLU(),
+                 skip_connection=False,
                  use_batch_norm=False,
                  prior_generator="fc",
                  GMM_model_name="VVI",
+                 connect_prior=False,
                  g_dim=50,
+                 out_type="scaled",
                  device=None,
                  legacy=False):
         super(Decoder, self).__init__()
@@ -633,6 +703,9 @@ class Decoder(nn.Module):
         self.use_batch_norm = use_batch_norm
         self.prior_generator = prior_generator
         self.GMM_model_name = GMM_model_name
+        self.connect_prior = connect_prior
+        self.skip_connection = skip_connection
+        self.out_type = out_type
 
         self.device = device
         self.legacy = legacy
@@ -640,10 +713,10 @@ class Decoder(nn.Module):
 
         # p(z|y)s
         if self.prior_generator.startswith("fc"):
-            self.y_mus_1 = DenseBlock(y_dim, z_dim, activation=activation)
+            self.y_mus_1 = DenseBlock(y_dim, z_dim, activation=activation, skip_connection=self.skip_connection)
             self.y_mus_2 = nn.Linear(z_dim, z_dim)
             if self.GMM_model_name == "VVI":
-                self.y_logvars_1 = DenseBlock(y_dim, z_dim, activation=activation)
+                self.y_logvars_1 = DenseBlock(y_dim, z_dim, activation=activation, skip_connection=self.skip_connection)
                 self.y_logvars_2 = nn.Linear(z_dim, z_dim)
         elif self.prior_generator.startswith("tensor"):
             self.mu_prior = nn.Parameter((torch.rand((y_dim, z_dim), device=self.device, requires_grad=True) - 0.5) * 2 * np.sqrt(6 / (y_dim + z_dim)))
@@ -675,13 +748,25 @@ class Decoder(nn.Module):
             self.generative_pxz = []
             for i_layer in range(len(self.in_channels)):
                 self.generative_pxz += [
-                    nn.Linear(self.in_channels[i_layer], self.out_channels[i_layer]),
+                    nn.Linear(self.in_channels[i_layer], self.out_channels[i_layer]) if ((not self.legacy) or (self.legacy == "stDyer") or (i_layer != len(self.in_channels) - 1)) else nn.Linear(self.in_channels[i_layer], 3000),
                     nn.BatchNorm1d(self.out_channels[i_layer]) if self.use_batch_norm else nn.Identity(),
                     activation,
                 ]
-            self.generative_pxz.append(nn.ModuleList([DenseBlock(self.out_channels[-1], g_dim, activation=activation), DenseBlock(self.out_channels[-1], g_dim, activation=activation)]))
-            self.generative_pxz.append(nn.ModuleList([nn.Linear(g_dim, g_dim), nn.Linear(g_dim, g_dim)]))
-            # self.generative_pxz.append(nn.ModuleList([nn.Linear(self.out_channels[-1], g_dim), nn.Linear(self.out_channels[-1], g_dim)]))
+            if not self.out_type.startswith("pca"):
+                if not self.legacy:
+                    self.generative_pxz.append(DenseBlock(self.out_channels[-1], g_dim, activation=activation, skip_connection=self.skip_connection)) #less useless parameter
+                    self.generative_pxz.append(nn.ModuleList([nn.Linear(g_dim, g_dim), nn.Identity()])) #less useless parameter
+                elif self.legacy == "stDyer":
+                    self.generative_pxz.append(nn.ModuleList([DenseBlock(self.out_channels[-1], g_dim, activation=activation, skip_connection=self.skip_connection), DenseBlock(self.out_channels[-1], g_dim, activation=activation, skip_connection=self.skip_connection)])) # old
+                    self.generative_pxz.append(nn.ModuleList([nn.Linear(g_dim, g_dim), nn.Linear(g_dim, g_dim)])) # old
+                else:
+                    self.generative_pxz.append(nn.ModuleList([DenseBlock(3000, g_dim, activation=activation, skip_connection=self.skip_connection), DenseBlock(3000, g_dim, activation=activation, skip_connection=self.skip_connection)]))
+                    self.generative_pxz.append(nn.ModuleList([nn.Linear(g_dim, g_dim), nn.Linear(g_dim, g_dim)]))
+            else:
+                self.generative_pxz.append(DenseBlock(self.out_channels[-1], g_dim, activation=activation, skip_connection=self.skip_connection)) # seems wrong
+                self.generative_pxz.append(nn.Linear(g_dim, g_dim))
+                self.generative_pxz.append(nn.ModuleList([nn.Identity(), nn.Linear(g_dim, self.z_dim)]))
+                self.generative_pxz.append(nn.ModuleList([nn.Identity(), nn.Linear(self.z_dim, g_dim)]))
             self.generative_pxz = nn.ModuleList(self.generative_pxz)
         elif self.rec_type == 'Poisson':
             # raise NotImplementedError
@@ -713,18 +798,22 @@ class Decoder(nn.Module):
                 self.k_exp = torch.exp
                 # self.r = torch.exp(self.r_para).cuda() # bug
                 # self.r = torch.exp(nn.Parameter(torch.cuda.FloatTensor(g_dim).normal_())) # hung
-                self.generative_pxz = [
-                    nn.Linear(z_dim, self.in_channels[0]),
-                    nn.BatchNorm1d(self.in_channels[0]) if self.use_batch_norm else nn.Identity(),
-                    activation,
-                ]
+                self.generative_pxz = []
                 for i_layer in range(len(self.in_channels)):
                     self.generative_pxz += [
-                        nn.Linear(self.in_channels[i_layer], self.out_channels[i_layer]),
+                        nn.Linear(self.in_channels[i_layer], self.out_channels[i_layer]) if ((not self.legacy) or (self.legacy == "stDyer") or (i_layer != len(self.in_channels) - 1)) else nn.Linear(self.in_channels[i_layer], 3000),
                         nn.BatchNorm1d(self.out_channels[i_layer]) if self.use_batch_norm else nn.Identity(),
                         activation,
                     ]
-                self.generative_pxz.append(nn.Linear(self.out_channels[-1], g_dim))
+                if not self.legacy:
+                    self.generative_pxz.append(DenseBlock(self.out_channels[-1], g_dim, activation=activation, skip_connection=self.skip_connection))
+                    self.generative_pxz.append(nn.Linear(g_dim, g_dim))
+                elif self.legacy == "stDyer":
+                    self.generative_pxz.append(DenseBlock(self.out_channels[-1], g_dim, activation=activation, skip_connection=self.skip_connection))
+                    self.generative_pxz.append(nn.Linear(g_dim, g_dim))
+                else:
+                    self.generative_pxz.append(DenseBlock(3000, g_dim, activation=activation, skip_connection=self.skip_connection))
+                    self.generative_pxz.append(nn.Linear(g_dim, g_dim))
                 self.generative_pxz = nn.ModuleList(self.generative_pxz)
             elif r_type == 'element-wise':
                 # r: number of failures until the experiment is stopped; p: probability of success
@@ -771,15 +860,30 @@ class Decoder(nn.Module):
 
     # p(x|z)s
     # @profile
-    def pxzs(self, zs):
+    def pxzs(self, zs, x):
         z_dict = {}
         # print('zs.shape:', zs.shape)
         z_dict['z'] = zs
+        z_2_fisrt = True # logvar_x appears first time
         for layers in self.generative_pxz:
             if isinstance(layers, nn.ModuleList):
                 for j_layer, layer in enumerate(layers, 1):
-                    z_dict['z_{}'.format(j_layer)] = layer(z_dict.get('z_{}'.format(j_layer), z_dict['z']))
-                    # print(layer, z_dict['z_{}'.format(j_layer)].shape)
+                    if isinstance(layer, nn.BatchNorm1d):
+                        try:
+                            C, B, D = z_dict['z_{}'.format(j_layer)].shape
+                        except:
+                            C, B, D = z_dict['z'].shape
+                        z_dict['z_{}'.format(j_layer)] = layers(z_dict.get('z_{}'.format(j_layer), z_dict['z']).view(-1, D)).view(C, B, D)
+                    else:
+                        if self.out_type.startswith("pca") and z_2_fisrt and j_layer == 2:
+                        # if z_2_fisrt and j_layer == 2:
+                            z_dict['z_{}'.format(j_layer)] = layer((z_dict['z_1'].detach() - x.dstdata['exp_feature'].unsqueeze(0)) / x.dstdata['exp_feature'].unsqueeze(0))
+                            z_2_fisrt = False
+                        else:
+                            if not self.out_type.startswith("pca") and j_layer == 2:
+                                continue
+                            z_dict['z_{}'.format(j_layer)] = layer(z_dict.get('z_{}'.format(j_layer), z_dict['z']))
+                        # print(layer, z_dict['z_{}'.format(j_layer)].shape)
             else:
                 if isinstance(layers, nn.BatchNorm1d):
                     C, B, D = z_dict['z'].shape
@@ -787,20 +891,19 @@ class Decoder(nn.Module):
                 else:
                     z_dict['z'] = layers(z_dict['z'])
                 # print(layers, z_dict['z'].shape)
+        if self.out_type.startswith("pca"):
+            z_dict['z_2'] = z_dict['z_2'].clamp(np.log(0.1), np.log(10))
         if self.rec_type == 'NegativeBinomial':
             z_dict['z_r_type'] = self.r_type
-            # if self.r_type == "gene-wise":
-                # z_dict['z_r'] = self.r_exp(self.r[0]).type_as(zs)
-                # z_dict['z_p'] = self.p_sigmoid(self.p[0]).type_as(zs)
-            z_dict['z_k'] = self.k_exp(z_dict['z']).type_as(zs)
+            z_dict['z_k'] = self.k_exp(z_dict['z']).clamp(0, 5000).type_as(zs)
         return z_dict
 
     # @profile
-    def get_prior_mu_logvar(self, onehot_idx=None):
+    def get_prior_mu_logvar(self, zs, onehot_idx=None):
         if onehot_idx is None:
-            onehot_y = self.onehot_y
+            onehot_y = self.onehot_y.to(zs.dtype)
         else:
-            onehot_y = torch.zeros((1, self.y_dim), device=self.device, dtype=torch.float32)
+            onehot_y = torch.zeros((1, self.y_dim), device=self.device, dtype=zs.dtype)
             onehot_y[0, onehot_idx] = 1
         y_mus = self.y_mus_2(self.y_mus_1(onehot_y))
         # ret_dict = {"prior_mu": y_mus}
@@ -813,12 +916,12 @@ class Decoder(nn.Module):
         return y_mus, y_logvars
 
     # @profile
-    def forward(self, y, zs, onehot_idx=None):
+    def forward(self, y, zs, x, onehot_idx=None):
         if self.prior_generator.startswith("fc"):
-            y_mus, y_logvars = self.get_prior_mu_logvar()
+            y_mus, y_logvars = self.get_prior_mu_logvar(zs)
         elif self.prior_generator.startswith("tensor"):
             y_mus, y_logvars = self.mu_prior, self.logvar_prior
-        x_recs = self.pxzs(zs)
+        x_recs = self.pxzs(zs, x)
         # onehot_idx is None & zs: C x D, C x D, B x C x N x G [C x B x G]
         # onehot_idx is None & z: 1 x D, 1 x D, B x 1 x N x G [1 x B x G]
         # onehot_idx is not None & zs: 1 x D, 1 x D, B x 1 x N x G [1 x B x G]

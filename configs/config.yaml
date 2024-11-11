@@ -34,7 +34,7 @@ ignore_warnings: False
 test_after_training: False
 
 # seed for random number generators in pytorch, numpy and python.random
-seed: null
+seed: 42
 
 # name of the run, should be used along with experiment mode
 name: null

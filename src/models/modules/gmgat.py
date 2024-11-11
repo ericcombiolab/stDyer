@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.init as init
 from src.models.modules.modules import (
     Encoder,
+    Prior,
     Decoder,
 )
 
@@ -47,6 +48,9 @@ class VAE(nn.Module):
         GMM_model_name="VVI",
         use_kl_bn=False,
         kl_bn_gamma=32.,
+        connect_prior=False,
+        in_type="scaled",
+        out_type="scaled",
         adata=None,
         device=torch.device("cpu"),
         legacy=False,
@@ -78,6 +82,9 @@ class VAE(nn.Module):
         self.GMM_model_name = GMM_model_name
         self.use_kl_bn = use_kl_bn
         self.kl_bn_gamma = kl_bn_gamma
+        self.connect_prior = connect_prior
+        self.in_type = in_type
+        self.out_type = out_type
         self.adata = adata
         self.device = device
         self.legacy = legacy
@@ -105,10 +112,24 @@ class VAE(nn.Module):
             GMM_model_name=self.GMM_model_name,
             use_kl_bn=self.use_kl_bn,
             kl_bn_gamma=self.kl_bn_gamma,
+            connect_prior=self.connect_prior,
+            in_type=self.in_type,
             adata=self.adata,
             device=self.device,
             legacy=self.legacy,
         )
+
+        if self.connect_prior:
+            self.prior = Prior(
+                y_dim=self.y_dim,
+                z_dim=self.latent_dim,
+                prior_generator=self.prior_generator,
+                GMM_model_name=self.GMM_model_name,
+                activation=self.activation,
+                device=self.device,
+            )
+        else:
+            self.prior = None
 
         self.decoder = Decoder(
             y_dim=self.y_dim,
@@ -119,8 +140,10 @@ class VAE(nn.Module):
             activation=self.activation,
             use_batch_norm=self.use_batch_norm,
             prior_generator=self.prior_generator,
-            g_dim=self.decoder_out_channels[-1],
+            g_dim=self.encoder_in_channels[0],
             GMM_model_name=self.GMM_model_name,
+            connect_prior=self.connect_prior,
+            out_type=self.out_type,
             device=self.device,
             legacy=self.legacy,
         )
@@ -137,11 +160,18 @@ class VAE(nn.Module):
                     init.constant_(m.bias, 0)
 
     def encode(self, x, neighbor_x):
-        y, mus, logvars, zs, var_invs, logits, prob_cat, att_x = self.encoder(x, neighbor_x)
+        if self.prior is not None:
+            y, mus, logvars, zs, var_invs, logits, prob_cat, att_x = self.encoder(x, neighbor_x, prior_y=self.prior(x)[0])
+        else:
+            y, mus, logvars, zs, var_invs, logits, prob_cat, att_x = self.encoder(x, neighbor_x)
         return mus, logvars, y, zs, var_invs, logits, prob_cat, att_x
 
-    def decode(self, y, zs):
-        y_mus, y_logvars, reconstructed = self.decoder(y, zs)
+    def decode(self, y, zs, x):
+        if self.connect_prior:
+            y_mus, y_logvars = self.prior(x)
+            reconstructed = self.decoder(y, zs, x)
+        else:
+            y_mus, y_logvars, reconstructed = self.decoder(y, zs, x)
         return y_mus, y_logvars, reconstructed
 
     # @profile
@@ -161,7 +191,7 @@ class VAE(nn.Module):
             x=x,
             neighbor_x=neighbor_x,
         )
-        y_mus, y_logvars, reconstructed = self.decode(y, zs)
+        y_mus, y_logvars, reconstructed = self.decode(y, zs, x)
         if self.GMM_model_name == "EEE":
             # C x D x D -> C x 1 x D^2
             logvars = logvars.reshape(logvars.shape[0], 1, -1)

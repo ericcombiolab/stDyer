@@ -50,4 +50,6 @@ seed: 42
 device: "auto"
 load_whole_graph_on_gpu: False
 z_scale: 2.
+resample_to: null
+n_jobs: "mean"
 use_ddp: False

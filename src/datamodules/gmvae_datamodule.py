@@ -152,12 +152,14 @@ class GMVAEDataModule(pl.LightningDataModule):
             dynamic_neigh_nums=self.data_val.dynamic_neigh_nums,
             dynamic_neigh_level=self.dynamic_neigh_level,
             unit_fix_num=self.unit_fix_num,
+            max_dynamic_neigh=self.max_dynamic_neigh,
             unit_dynamic_num=self.unit_dynamic_num,
             start_use_domain_neigh=self.start_use_domain_neigh,
             adata=self.data_val.adata,
             load_whole_graph_on_gpu=self.load_whole_graph_on_gpu,
             seed=self.seed,
             device=self.dgl_device,
+            annotation_key=self.data_val.annotation_key,
         )
 
     def setup(self, stage=None):

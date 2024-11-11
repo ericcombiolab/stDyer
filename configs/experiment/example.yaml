@@ -63,9 +63,6 @@ datamodule:
   data_file_name: "STARmap_20180505_BY3_1k.h5ad"
   data_type: "custom"
 
-  # number of predicted spatial domains
-  num_classes: 7
-
   # number of highly variable genes
   num_hvg: 3000
 

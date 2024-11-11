@@ -1,9 +1,7 @@
 # import faulthandler
 # faulthandler.enable()
-
 import hydra
 import rootutils
-# import pyrootutils as rootutils
 from omegaconf import DictConfig
 import warnings
 warnings.filterwarnings("ignore", message="Variable names are not unique. ")
@@ -20,8 +18,6 @@ warnings.filterwarnings("ignore", message=".*srun.*")
 warnings.filterwarnings("ignore", message=".*Created a temporary directory.*")
 warnings.filterwarnings("ignore", message=".*_remote_module_non_scriptable.*")
 warnings.filterwarnings("ignore", message=".*on epoch level in distributed setting to accumulate the metric across devices.*")
-
-# import comet_ml
 
 # project root setup
 # searches for root indicators in parent dirs, like ".git", "pyproject.toml", etc.

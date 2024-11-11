@@ -115,6 +115,8 @@ class GraphDataset(Dataset):
         elif self.data_type == 'bgi':
             self.bin_size = 50
             self.get_bgi_data()
+        elif self.data_type == 'STARmap':
+            self.get_STARmap_data()
         elif self.data_type == "custom":
             self.get_custom_data()
         self.compute_nearest()
@@ -223,12 +225,12 @@ class GraphDataset(Dataset):
             self.dynamic_neigh_nums = [self.k] * self.num_classes
         elif self.dynamic_neigh_level.name.startswith("unit"):
             if self.dynamic_neigh_level.name.startswith("unit_fix_domain"):
-                self.dynamic_neigh_nums = [self.unit_fix_num] * len(self.adata)
+                self.dynamic_neigh_nums = [self.max_dynamic_neigh] * len(self.adata)
             else:
                 self.dynamic_neigh_nums = [self.k] * len(self.adata)
 
     # @profile
-    def preprocess_data(self, filter_by_counts=True, reuse_existing_pca=False, reuse_existing_knn=False, max_scale_value=None, not_labelled_value=None):
+    def preprocess_data(self, filter_by_counts=True, reuse_existing_pca=False, reuse_existing_knn=False, max_scale_value=None, not_labelled_value=None, skip_preprocess=False):
         if self.resample_to:
             resample_idx = self.rng.integers(len(self.adata), size=self.resample_to)
             self.adata = self.adata[resample_idx, :].copy()
@@ -266,10 +268,22 @@ class GraphDataset(Dataset):
             whether_copy = self.adata.X != self.adata.layers[self.count_key]
             if (isinstance(whether_copy, np.ndarray) and (whether_copy).any()) or (scipy.sparse.issparse(whether_copy) and whether_copy.nnz > 0):
                 self.adata.X = self.adata.layers[self.count_key].astype(np.float32).copy()
+        if self.out_type == "raw":
+            self.adata.layers[self.count_key] = self.adata.layers[self.count_key].toarray() if scipy.sparse.issparse(self.adata.layers[self.count_key]) else self.adata.layers[self.count_key]
+            gene_mean = self.adata.layers[self.count_key].mean(axis=0)
+            gene_var = self.adata.layers[self.count_key].var(axis=0)
+            # good_gene_idx = gene_var < np.quantile(gene_var, 0.99)
+            # popt, _ = curve_fit(nb_func, gene_mean[good_gene_idx], gene_var[good_gene_idx])
+            print("gene_mean", gene_mean)
+            print("gene_var", gene_var)
+            popt, _ = curve_fit(nb_func, gene_mean, gene_var)
+            self.adata.uns["r"] = popt[0]
+        else:
+            self.adata.uns["r"] = -1
         logging.debug("Filtering genes and cells.")
         tic = time.time()
 
-        if filter_by_counts:
+        if (not skip_preprocess) and filter_by_counts:
             sc.pp.filter_genes(self.adata, min_counts=1)
             if self.dataset_dir == "CTL":
                 sc.pp.filter_genes(self.adata, min_cells=100)
@@ -283,10 +297,10 @@ class GraphDataset(Dataset):
             assert self.in_type == 'pca_scaled' or self.in_type == 'pca'
             self.adata.obsm["X_pca"] = self.adata.obsm[self.pca_key]
         else:
-            if self.num_hvg is not None:
+            if (not skip_preprocess) and (self.num_hvg is not None):
                 if isinstance(self.num_hvg, float):
                     self.num_hvg = int(self.num_hvg * self.adata.shape[1])
-                elif isinstance(self.num_hvg, int):
+                elif isinstance(self.num_hvg, int) and self.num_hvg < self.adata.X.shape[1]:
                     logging.debug("Selecting highly variable genes.")
                     tic = time.time()
                     # sc.pp.highly_variable_genes(self.adata, n_top_genes=self.num_hvg, flavor="cell_ranger", subset=True)
@@ -294,67 +308,63 @@ class GraphDataset(Dataset):
                     toc = time.time()
                     logging.debug(f"Selecting highly variable genes takes {(toc - tic)/60:.2f} mins.")
 
-            if filter_by_counts:
+            if (not skip_preprocess) and filter_by_counts:
                 sc.pp.filter_cells(self.adata, min_counts=1)
             try:
                 self.adata.X = self.adata.X.astype(np.float32).toarray()
             except:
                 pass
-            if self.lib_norm:
+            if (not skip_preprocess) and self.lib_norm:
                 logging.debug("Normalizing data to the median libaray size.")
                 tic = time.time()
-                self.adata.uns['target_library_size'] = np.median(self.adata.X.sum(1)).astype(np.int32)
-                sc.pp.normalize_total(self.adata)
-                # sc.pp.normalize_total(self.adata, target_sum=1e4)
+                if self.lib_norm is True:
+                    self.adata.uns['target_library_size'] = np.median(self.adata.X.sum(1)).astype(np.int32)
+                    sc.pp.normalize_total(self.adata)
+                elif isinstance(self.lib_norm, int):
+                    self.adata.uns['target_library_size'] = self.lib_norm
+                    sc.pp.normalize_total(self.adata, target_sum=self.lib_norm)
                 toc = time.time()
                 logging.debug(f"Normalizing data to the median libaray size takes {(toc - tic)/60:.2f} mins.")
-
-            logging.debug("Log transforming data.")
-            tic = time.time()
-            sc.pp.log1p(self.adata)
-            toc = time.time()
-            logging.debug(f"Log transforming data takes {(toc - tic)/60:.2f} mins.")
-            self.adata.layers['unscaled'] = self.adata.X.copy()
-            logging.debug("Scaling data.")
-            tic = time.time()
-            if max_scale_value is not None:
-                sc.pp.scale(self.adata)
-            else:
-                sc.pp.scale(self.adata, max_value=max_scale_value)
-            # sc.pp.scale(self.adata, zero_center=False, max_value=10)
-            self.adata.var['mean'] = self.adata.var['mean'].astype(np.float32)
-            self.adata.var['std'] = self.adata.var['std'].astype(np.float32)
-            toc = time.time()
-            logging.debug(f"Scaling data takes {(toc - tic)/60:.2f} mins.")
-            self.adata.layers['scaled'] = self.adata.X.copy()
-            logging.debug("Running PCA.")
-            tic = time.time()
-            if self.adata.shape[1] > self.n_pc:
-                pca = PCA(n_components=self.n_pc, random_state=self.seed)
-                if self.in_type == 'pca_unscaled':
-                    self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.layers['unscaled'])
-                elif self.in_type == 'pca_scaled' or self.in_type == 'pca' or self.in_type == "pca_harmony":
-                    self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.layers['scaled'])
-                    if self.in_type == "pca_harmony":
-                        import scanpy.external as sce
-                        sce.pp.harmony_integrate(self.adata, "batch")
+            if not skip_preprocess:
+                logging.debug("Log transforming data.")
+                tic = time.time()
+                sc.pp.log1p(self.adata)
+                toc = time.time()
+                logging.debug(f"Log transforming data takes {(toc - tic)/60:.2f} mins.")
+                self.adata.layers['unscaled'] = self.adata.X.copy()
+                logging.debug("Scaling data.")
+                tic = time.time()
+                if max_scale_value is not None:
+                    sc.pp.scale(self.adata)
                 else:
-                    self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.X)
-                self.adata.uns["normalized_pca_explained_variance_ratio"] = pca.explained_variance_ratio_ / pca.explained_variance_ratio_.sum()
-                self.adata.uns['pca'] = pca
-            else:
-                logging.warning(f"Number of genes is smaller than the number of PCs. Using scaled genes as PCs.")
-                self.adata.obsm["X_pca"] = self.adata.layers['scaled'].copy()
-            toc = time.time()
-            logging.debug(f"Running PCA takes {(toc - tic)/60:.2f} mins.")
-        if self.out_type == "raw":
-            gene_mean = self.adata.layers[self.count_key].mean(axis=0)
-            gene_var = self.adata.layers[self.count_key].var(axis=0)
-            good_gene_idx = gene_var < np.quantile(gene_var, 0.99)
-            popt, _ = curve_fit(nb_func, gene_mean[good_gene_idx], gene_var[good_gene_idx])
-            self.adata.uns["r"] = popt[0]
-        else:
-            self.adata.uns["r"] = -1
+                    sc.pp.scale(self.adata, max_value=max_scale_value)
+                # sc.pp.scale(self.adata, zero_center=False, max_value=10)
+                self.adata.var['mean'] = self.adata.var['mean'].astype(np.float32)
+                self.adata.var['std'] = self.adata.var['std'].astype(np.float32)
+                toc = time.time()
+                logging.debug(f"Scaling data takes {(toc - tic)/60:.2f} mins.")
+                self.adata.layers['scaled'] = self.adata.X.copy()
+                logging.debug("Running PCA.")
+                tic = time.time()
+                if self.adata.shape[1] > self.n_pc:
+                    pca = PCA(n_components=self.n_pc, random_state=self.seed)
+                    if self.in_type == 'pca_unscaled':
+                        self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.layers['unscaled'])
+                    elif self.in_type == 'pca_scaled' or self.in_type == 'pca' or self.in_type == "pca_harmony":
+                        self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.layers['scaled'])
+                        if self.in_type == "pca_harmony":
+                            import scanpy.external as sce
+                            sce.pp.harmony_integrate(self.adata, "batch")
+                    else:
+                        self.adata.obsm["X_pca"] = pca.fit_transform(self.adata.X)
+                    self.adata.uns["normalized_pca_explained_variance_ratio"] = pca.explained_variance_ratio_ / pca.explained_variance_ratio_.sum()
+                    self.adata.uns['pca'] = pca
+                else:
+                    logging.warning(f"Number of genes is smaller than the number of PCs. Using scaled genes as PCs.")
+                    self.adata.obsm["X_pca"] = self.adata.layers['scaled'].copy()
+                toc = time.time()
+                logging.debug(f"Running PCA takes {(toc - tic)/60:.2f} mins.")
+
         self.set_class_num()
         self.adata.obs["pred_labels"] = 0
         self.adata.obsm["prob_cat"] = np.zeros((len(self.adata), self.num_classes), dtype=np.float32)
@@ -365,7 +375,7 @@ class GraphDataset(Dataset):
         tic = time.time()
         if not self.test_with_gt_sp:
             neigh = NearestNeighbors(n_neighbors=self.max_dynamic_neigh, n_jobs=self.n_jobs)
-            if (self.data_type == "10x" and len(self.sample_id.split('_')) > 1 and (not self.sample_id.startswith("GSM"))):
+            if (self.data_type == "10x" and len(self.sample_id.split('_')) > 1 and self.sample_id != "zebrafish_tumor"):
                 neigh.fit(self.adata[self.adata.obs["batch"] == 0].obsm['spatial'])
                 first_slide_sp_dist, _ = neigh.kneighbors(return_distance=True)
                 min_unit_dist = first_slide_sp_dist.min()
@@ -374,7 +384,7 @@ class GraphDataset(Dataset):
                 neigh.fit(self.adata[self.adata.obs["batch"] == self.adata.obs["batch"].unique()[0]].obsm['spatial'])
                 first_slide_sp_dist, _ = neigh.kneighbors(return_distance=True)
                 min_unit_dist = first_slide_sp_dist.min()
-                self.adata.obsm['spatial'] = np.hstack((self.adata.obsm['spatial'], (self.adata.obs["batch"] * min_unit_dist * self.z_scale).to_numpy().reshape(-1, 1)))
+                self.adata.obsm['spatial'] = np.hstack((self.adata.obsm['spatial'], (self.adata.obs["batch"].astype(np.float32) * min_unit_dist * self.z_scale).to_numpy().reshape(-1, 1)))
             neigh.fit(self.adata.obsm['spatial'])
             self.adata.obsm['sp_dist'], self.adata.obsm['sp_k'] = neigh.kneighbors(return_distance=True)
         else:
@@ -387,13 +397,20 @@ class GraphDataset(Dataset):
         if self.supervise_cat or self.exchange_forward_neighbor_order:
             raise NotImplementedError
         if not self.test_with_gt_sp:
-            self.adata.obsm['sp_adj'] = neigh.kneighbors_graph()
+            self.adata.obsp['sp_adj'] = neigh.kneighbors_graph()
         else:
-            self.adata.obsm['sp_adj'] = gt_neighbor_graph
+            self.adata.obsp['sp_adj'] = gt_neighbor_graph
         self.adata.obsm["consist_adj"] = np.ones_like(self.adata.obsm["sp_k"]).astype(np.bool_)
         toc = time.time()
         logging.debug(f"Computing spatial nearest neighbors takes {(toc - tic)/60:.2f} mins.")
         gc.collect()
+
+    def get_STARmap_data(self):
+        self.count_key = "counts"
+        self.annotation_key = "label"
+        self.adata = sc.read_h5ad(osp.join(self.data_dir, self.dataset_dir, self.sample_id + ".h5ad"))
+        self.adata.layers[self.count_key] = self.adata.X.copy()
+        self.preprocess_data(max_scale_value=10.)
 
     def get_custom_data(self):
         self.adata = sc.read_h5ad(osp.join(self.data_dir, self.dataset_dir, self.data_file_name))
@@ -420,7 +437,14 @@ class GraphDataset(Dataset):
         self.adata = sc.read_h5ad(exp_file_path)
         toc = time.time()
         logging.debug(f"Loading data takes {(toc - tic)/60:.2f} mins.")
-        if self.sample_id in ["E12.5_E1S3.MOSTA", "E14.5_E1S3.MOSTA", "E16.5_E1S3.MOSTA", "E16.5_E2S1.MOSTA", "E16.5_E2S2.MOSTA", "E16.5_E2S3.MOSTA", "E16.5_E2S4.MOSTA", "E16.5_E2S5.MOSTA", "E16.5_E2S6.MOSTA", "E16.5_E2S7.MOSTA", "E16.5_E2S8.MOSTA", "E16.5_E2S9.MOSTA", "E16.5_E2S10.MOSTA", "E16.5_E2S11.MOSTA", "E16.5_E2S12.MOSTA", "E16.5_E2S13.MOSTA"]:
+        if self.sample_id in [
+            "E12.5_E1S3.MOSTA", "E14.5_E1S3.MOSTA", "E16.5_E1S3.MOSTA", "E16.5_E2S1.MOSTA",
+            "E16.5_E2S2.MOSTA", "E16.5_E2S3.MOSTA", "E16.5_E2S4.MOSTA", "E16.5_E2S5.MOSTA",
+            "E16.5_E2S6.MOSTA", "E16.5_E2S7.MOSTA", "E16.5_E2S8.MOSTA", "E16.5_E2S9.MOSTA",
+            "E16.5_E2S10.MOSTA", "E16.5_E2S11.MOSTA", "E16.5_E2S12.MOSTA", "E16.5_E2S13.MOSTA",
+            "E11.5_E1S1.MOSTA", "E11.5_E1S2.MOSTA", "E11.5_E1S3.MOSTA", "E11.5_E1S4.MOSTA",
+            "E9.5_E1S1.MOSTA", "E9.5_E2S1.MOSTA", "E9.5_E2S2.MOSTA", "E9.5_E2S3.MOSTA", "E9.5_E2S4.MOSTA"
+            ]:
             self.annotation_key = "annotation"
             self.count_key = "count"
         self.preprocess_data()

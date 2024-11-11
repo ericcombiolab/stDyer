@@ -1,0 +1,85 @@
+# @package _global_
+defaults:
+  - override /mode: exp.yaml
+  - override /trainer: stdyer.yaml
+  - override /model: dgg.yaml
+  - override /datamodule: dgg.yaml
+  - override /callbacks: stdyer.yaml
+  - override /logger: none.yaml
+name: dgl_STARmap
+model:
+  lr: 0.001
+
+  prior_lr: 0.2
+  gaussian_size: 64
+  attention_size: 64
+  exp_encoder_channels: [3000, 128, 256, 64] # [50, 64]
+  exp_decoder_channels: [64, 256, 128, 3000] # [64, 50]
+  # the number of spatially variable genes to detect for each domain
+  detect_svg: 50
+
+  # a simple autoencoder will be used to refine the predicted domain labels (saved in obs["mlp_fit"])
+  # the raw predicted domain labels will NOT be overwritten and are saved in obs["pred_labels"]
+  # set to null to disable the refinement (recommend to disable it for large datasets with > 100k units)
+  refine_ae_channels: [64, 64, 64]
+
+  # weight for neighbor loss, higher weights will make the predicted domains smoother
+  exp_neigh_w: 1.
+
+  # starting from this epoch to use fused graph
+  patience_start_epoch_pct: 50
+  # starting from this epoch to use Gaussian loss
+  gaussian_start_epoch_pct: 50
+
+  prior_generator: fc_louvain_agg_origin_50
+  agg_linkage: average
+  ext_resolution: '2.'
+
+  # parameter of semi-supervised cross-entropy loss
+  # higher weights can make the model stick to the domain labels initialized by mclust
+  # lower weights can make the model more flexible to update the domain labels
+  # you can set it with either "1.001" or "1.01" for testing
+  semi_ce_degree: "1.01"
+
+trainer:
+  # number of epochs to train
+  max_epochs: 200
+  # number of GPUs to use
+  devices: 1
+
+datamodule:
+  # data_dir: "/home/comp/20481195/Datasets/STARmap"
+  data_dir: "/mnt/datasets/spatial_datasets/STARmap"
+  dataset_dir: "20180505_BY3_1kgenes"
+  data_type: "STARmap"
+  sample_id: "mouse_cortex"
+
+  # number of highly variable genes
+  num_hvg: 3000
+
+  # a: number of fixed spatial units to use
+  unit_fix_num: 4
+  # b: number of dynamic domain units to use
+  unit_dynamic_num: 4
+  k: 8 # a+b
+  rec_neigh_num: 8 # a+b
+  forward_neigh_num: 8 # a+b
+  max_dynamic_neigh: 8 # a+b
+
+  # use all highly variable genes and perform z-score normalization for model input and reconstruction
+  # if you want to use PCA, set it to "pca_scaled"
+  in_type: "scaled" # "pca_scaled"
+  out_type: "scaled" # "pca_scaled"
+  # number of pricipal components to use for PCA
+  # n_pc: 50
+
+  # set smaller batch_size (e.g., 256) for dataset
+  #     1. with fewer cells to improve convergence speed;
+  #     2. with more cells but low-end GPU to avoid "out of GPU memory error";
+  # set larger batch_size (e.g., 1024, 4096) for dataset with more cells on high-end GPU to improve GPU utilization;
+  batch_size: 256 # 1024
+
+  seed: 3407
+
+  # set pin_memory to False if you are using WSL2 (windows subsystem for linux)
+  pin_memory: false

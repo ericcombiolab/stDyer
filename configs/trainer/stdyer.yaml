@@ -26,4 +26,4 @@ strategy:
   process_group_backend: "gloo"
   timeout:
     _target_: datetime.timedelta
-    hours: 12
+    hours: 120

@@ -7,8 +7,6 @@ exp_neigh_w: 1.
 
 use_batch_norm: False
 
-use_pseudo_labels: False
-
 patience: 1.
 patience_start_epoch_pct: 100
 patience_diff_pct: 0.01
@@ -52,6 +50,10 @@ max_logvar: 5.
 min_logvar: -5.
 use_kl_bn: False
 kl_bn_gamma: 32.
+mclust_init_subset_num: 10000
+ext_resolutions: 1.
+jacard_prune: 0.15
+agg_linkage: "ward"
 min_cluster_size: 100
 
 exp_encoder_channels: null
@@ -97,3 +99,4 @@ inbalance_weight: False
 
 verbose_loss: False
 debug: False
+legacy: "stDyer"

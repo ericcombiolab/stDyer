@@ -16,6 +16,7 @@ from sklearn.neighbors import NearestNeighbors
 from collections import defaultdict
 import warnings
 import torch.distributed as dist
+import seaborn as sns
 
 # https://stackoverflow.com/questions/71433507/pytorch-python-distributed-multiprocessing-gather-concatenate-tensor-arrays-of
 def gather_nd_to_rank(tensor, axis=0, rank=0):
@@ -615,6 +616,7 @@ def log_umap_figure(
             plt.gca().invert_yaxis()
         sc_fig = plt.gcf()
         sc_fig.savefig(gt_umap_figure_path, dpi=300, bbox_inches="tight")
+        # plt.show()
         plt.close()
         if "fov" in adata.obs.keys():
             sorted_unique_fov = np.sort(adata.obs["fov"].unique())
@@ -625,6 +627,7 @@ def log_umap_figure(
                 plt.gca().invert_yaxis()
             sc_fig = plt.gcf()
             sc_fig.savefig(batch_umap_figure_path, dpi=300, bbox_inches="tight")
+            # plt.show()
             plt.close()
         if "niche" in adata.obs.keys():
             sorted_unique_niche = np.sort(adata.obs["niche"].unique())
@@ -635,6 +638,7 @@ def log_umap_figure(
                 plt.gca().invert_yaxis()
             sc_fig = plt.gcf()
             sc_fig.savefig(niche_umap_figure_path, dpi=300, bbox_inches="tight")
+            # plt.show()
             plt.close()
 
     else:
@@ -678,6 +682,7 @@ def log_umap_figure(
             plt.gca().invert_yaxis()
         sc_fig = plt.gcf()
         sc_fig.savefig(pred_umap_figure_path, dpi=300, bbox_inches="tight")
+        # plt.show()
         plt.close()
     else:
         pred_umap_figure_path = None
@@ -768,6 +773,7 @@ def log_tissue_graph(
                 plt.gca().invert_yaxis()
         sc_fig = plt.gcf()
         sc_fig.savefig(gt_tissue_graph_path, dpi=300, bbox_inches="tight")
+        # plt.show()
         plt.close()
     else:
         gt_tissue_graph_path = None
@@ -788,7 +794,7 @@ def log_tissue_graph(
                 scatter_df_cols = ["x", "y", "z"]
             scatter_df = pd.DataFrame(adata.obsm["spatial"], columns=scatter_df_cols)
             pred_cluster_num = len(np.unique(pred_labels))
-            if "annotation_colors" in adata.uns:
+            if ("annotation_colors" in adata.uns) and (len(adata.obs["plot_pred_labels"].cat.categories) <= len(adata.uns["annotation_colors"])):
                 try:
                     scatter_df[f"{annotation_key}"] = adata.obs["plot_pred_labels"].cat.rename_categories(adata.uns["annotation_colors"][:pred_cluster_num]).values
                 except:
@@ -822,6 +828,7 @@ def log_tissue_graph(
                 plt.gca().invert_yaxis()
         sc_fig = plt.gcf()
         sc_fig.savefig(pred_tissue_graph_path, dpi=300, bbox_inches="tight")
+        # plt.show()
         plt.close()
     else:
         pred_tissue_graph_path = None

@@ -35,11 +35,14 @@ class MyDGLDataset(DGLDataset):
         dynamic_neigh_nums=None,
         dynamic_neigh_level=Dynamic_neigh_level.unit,
         unit_fix_num=None,
+        max_dynamic_neigh=None,
         unit_dynamic_num=None,
         start_use_domain_neigh=False,
         adata=None,
         load_whole_graph_on_gpu=False,
         seed=0,
+        device="cuda",
+        annotation_key=None,
         **kwargs,
     ) -> None:
         super().__init__(name=sample_id)
@@ -50,9 +53,13 @@ class MyDGLDataset(DGLDataset):
         self.dynamic_neigh_nums = dynamic_neigh_nums
         self.dynamic_neigh_level = dynamic_neigh_level
         self.unit_fix_num = unit_fix_num
+        self.max_dynamic_neigh = max_dynamic_neigh
         self.unit_dynamic_num = unit_dynamic_num
         self.start_use_domain_neigh = start_use_domain_neigh
         self.load_whole_graph_on_gpu = load_whole_graph_on_gpu
+        self.annotation_key = annotation_key
+        self.network_key = "sp_k"
+        self.device = device
         self.rng = np.random.default_rng(seed)
         us = []
         vs = []
@@ -93,20 +100,7 @@ class MyDGLDataset(DGLDataset):
                 #     print("Load pred_labels for validation postprocessing.")
                 #     self.adata.obs["pred_labels"] = pd.read_csv(label_path)
                 # add units relevant to dynamic domain neighbors
-                for j in np.unique(self.adata.obs["pred_labels"]):
-                    curr_domain_unit_idx = self.adata.obs["pred_labels"] == j
-                    curr_domain_unit_num_idx = np.where(curr_domain_unit_idx)[0]
-                    # !! what if rng choice select the target unit itself as neighbors?
-                    if self.dynamic_neigh_level == Dynamic_neigh_level.unit_fix_domain_boundary:
-                        # only for boundary units, we use the same domain units
-                        curr_domain_boundary_unit_num_idx = get_domain_boundary_unit_indices(self.adata, domain_idx=j)
-                        same_domain_random_unit_idx = self.rng.choice(curr_domain_unit_num_idx, (len(curr_domain_boundary_unit_num_idx), self.unit_dynamic_num), replace=True)
-                        self.adata.obsm["used_k"][curr_domain_boundary_unit_num_idx, self.unit_fix_num:] = same_domain_random_unit_idx
-                    elif self.dynamic_neigh_level == Dynamic_neigh_level.unit_fix_domain:
-                        # for all current domain unit, we use the same domain units
-                        curr_domain_all_unit_num_idx = curr_domain_unit_num_idx
-                        same_domain_random_unit_idx = self.rng.choice(curr_domain_unit_num_idx, (len(curr_domain_all_unit_num_idx), self.unit_dynamic_num), replace=True)
-                        self.adata.obsm["used_k"][curr_domain_all_unit_num_idx, self.unit_fix_num:] = same_domain_random_unit_idx
+                self.construct_used_k_for_unit_fix_domain()
                 # add domain neighbors
                 us += self.adata.obsm["used_k"][:, self.unit_fix_num:].flatten().tolist()
                 vs += np.repeat(np.arange(self.adata.shape[0]), self.unit_dynamic_num).tolist()
@@ -165,6 +159,16 @@ class MyDGLDataset(DGLDataset):
 
     def process(self):
         pass
+
+    def construct_used_k_for_unit_fix_domain(self):
+        for j in np.unique(self.adata.obs["pred_labels"]):
+            curr_domain_unit_idx = self.adata.obs["pred_labels"] == j
+            curr_domain_unit_num_idx = np.where(curr_domain_unit_idx)[0]
+            # only for boundary units, we use the same domain units
+            curr_domain_boundary_unit_num_idx = get_domain_boundary_unit_indices(self.adata, domain_idx=j)
+            neighbor_candidates = curr_domain_unit_num_idx
+            same_domain_random_unit_idx = self.rng.choice(neighbor_candidates, (len(curr_domain_boundary_unit_num_idx), self.unit_dynamic_num), replace=True)
+            self.adata.obsm["used_k"][curr_domain_boundary_unit_num_idx, self.unit_fix_num:] = same_domain_random_unit_idx
 
     # def __len__(self):
     #     return 1
