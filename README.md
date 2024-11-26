@@ -72,4 +72,4 @@ python run.py experiment=example_multi_slices.yaml
 ```
 
 ### For reproducing the results in the paper
-You can check https://doi.org/10.5281/zenodo.11315102 to download the processed data and reproducible Jupyter notebooks. Please read the README.md inside the zip file for details.
+You can check https://doi.org/10.5281/zenodo.11315101 to download the processed data and reproducible Jupyter notebooks. Please read the README.md inside the zip file for details.
