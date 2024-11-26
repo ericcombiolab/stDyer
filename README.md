@@ -29,7 +29,10 @@ conda env create -f stdyer.yml
 conda activate stdyer
 ```
 
-### For the dataset with a single slide
+## Tutorial
+There is a tutorial notebook [tutorial.ipynb](tutorial.ipynb) that demonstrates how to train the model with a single slice dataset. For more advanced usage using command line, please refer to the following sections:
+
+### For the dataset with a single slice
 Train model with chosen experiment configuration from [configs/experiment/](configs/experiment/)
 
 ```bash
@@ -61,11 +64,11 @@ cp configs/experiment/example_ddp.yaml configs/experiment/your_experiment.yaml
 python run.py experiment=your_experiment.yaml
 ```
 
-### For the dataset with a multiple slides
-To train with a dataset with multiple slides, you need to first align the dataset with paste2. Refer to [align_multiple_slides_with_paste2.ipynb](align_multiple_slides_with_paste2.ipynb) for preprocessing steps. You can then train with [configs/experiment/example_multi_slides.yaml](configs/experiment/example_multi_slides.yaml). For your own dataset, make sure the obs attribute of the anndata object has the "batch" column (`adata.obs["batch"]`), which indicates the slide index. Set `z_scale` with a meaningful value (refer to config file for details) as `adata.obs["batch"] * z_scale * min_two_units_xy_distance` will be considered as the third coordinate for constructing spatial adjacency graph besides two coordinates in `adata.obsm["spatial"]`.
+### For the dataset with a multiple slices
+To train with a dataset with multiple slices, you need to first align the dataset with paste2. Refer to [align_multiple_slices_with_paste2.ipynb](align_multiple_slices_with_paste2.ipynb) for preprocessing steps. You can then train with [configs/experiment/example_multi_slices.yaml](configs/experiment/example_multi_slices.yaml). For your own dataset, make sure the obs attribute of the anndata object has the "batch" column (`adata.obs["batch"]`), which indicates the slice index. Set `z_scale` with a meaningful value (refer to config file for details) as `adata.obs["batch"] * z_scale * min_two_units_xy_distance` will be considered as the third coordinate for constructing spatial adjacency graph besides two coordinates in `adata.obsm["spatial"]`.
 
 ```bash
-python run.py experiment=example_multi_slides.yaml
+python run.py experiment=example_multi_slices.yaml
 ```
 
 ### For reproducing the results in the paper
